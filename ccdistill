@@ -58,6 +58,7 @@ Notes:
     (only touches user/assistant + known block types) and warns on an unseen version.
 """
 
+from __future__ import annotations   # `X | Y` annotations on Python 3.8/3.9 (e.g. Big Sur)
 import sys, os, re, json, glob, argparse
 from pathlib import Path
 
