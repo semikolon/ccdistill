@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+ccdistill — distill a Claude Code session JSONL into a lean resume brief.
+
+Purpose:
+  Resuming a large, cold (>cache-TTL) CC session with `claude --resume` reprocesses
+  the ENTIRE transcript as fresh input on the first turn — one of the most expensive
+  requests you can send, spent mostly re-reading tool-output noise you'll ignore.
+  Instead: distill the transcript from disk to signal (human + assistant text,
+  reasoning, and which tools were called + why), drop the bulky tool OUTPUTS /
+  injected CLAUDE.md / system-reminders, and hand THAT to a FRESH session which
+  reconstructs state cheaply and verifies against the live repo before acting.
+
+Deterministic — no LLM call. The fresh session does the reconstruction as its first
+turn (which is a turn you were going to send anyway), so it's effectively free.
+
+Usage:
+  ccdistill                     # newest session in the current dir's project
+  ccdistill <session-id>        # a specific session (searched across all roots)
+  ccdistill <path/to.jsonl>     # a specific transcript file
+  ccdistill --list [--json]     # discover recent sessions (non-interactive; for agents)
+  ccdistill --pick              # interactive numbered picker (human terminal only)
+  ccdistill --project <name>    # newest session in a named project
+
+  ccdistill | pbcopy            # then paste into a fresh `claude` and hit enter
+  ccdistill -o /tmp/handoff.md  # then in fresh claude: "read /tmp/handoff.md and continue"
+
+Agents / scripts (non-interactive): `ccdistill --list --json` → choose an id
+(size_kb hints how substantial a session is — skip a tiny just-started one, e.g.
+your own) → `ccdistill <id>`. `--pick` is for a human terminal and errors under
+a non-tty rather than hanging.
+
+Flags:
+  -o FILE            write to FILE instead of stdout
+  --list             list recent sessions, machine-readable (id/time/size/project/title)
+  --json             with --list: JSON instead of TSV
+  --limit N          with --list: max rows (default 20)
+  --pick             interactive picker (human terminal only; errors under a non-tty)
+  --project NAME     select within a named project instead of cwd
+  --all-projects     with --list/--pick, span every project
+  --no-thinking      drop assistant reasoning (thinking) blocks
+  --thinking-chars N truncate each thinking block to N chars (default 700)
+  --no-header        omit the repo-verify resume-prompt header
+  --raw              transcript only, no header + no metadata (for further piping)
+
+Env:
+  CCDISTILL_USER_LABEL     label for the human's turns (default: User)
+  CCDISTILL_ARCHIVE_ROOTS  extra transcript roots (os.pathsep-separated) beyond
+                           ~/.claude/projects — e.g. an archive volume
+
+Notes:
+  - Handles the compaction chain (multiple files sharing one sessionId).
+  - Dodges the stale-transcript-path bug by resolving via sessionId + newest mtime.
+  - Skips subagent/sidechain turns, compaction summaries, and all metadata line types
+    (attachment/system/file-history-snapshot/permission-mode/...), which is where
+    modern CC injects CLAUDE.md + <system-reminder>.
+  - Schema is internal to CC and drifts across versions; parser is defensive
+    (only touches user/assistant + known block types) and warns on an unseen version.
+"""
+
+import sys, os, re, json, glob, argparse
+from pathlib import Path
+
+HOME = Path.home()
+LIVE_ROOT = HOME / ".claude" / "projects"
+# Extra transcript roots (e.g. an archive volume) — os.pathsep-separated, searched
+# after the live root. Set CCDISTILL_ARCHIVE_ROOTS to include archived sessions.
+_EXTRA_ROOTS = [p for p in os.environ.get("CCDISTILL_ARCHIVE_ROOTS", "").split(os.pathsep) if p.strip()]
+USER_LABEL = os.environ.get("CCDISTILL_USER_LABEL", "User")   # label for the human's turns
+KNOWN_VERSION_PREFIX = "2."          # warn (don't fail) outside this major line
+
+# text blocks defensively skipped if an older-version session inlines boilerplate
+_NOISE = ("<system-reminder>", "Codebase and user instructions are shown below",
+          "This session is being continued", "<command-name>",
+          "<local-command-stdout>", "DO NOT respond to these")
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|(api[_-]?key|secret|token|password|bearer)\s*[:=]\s*['\"]?[A-Za-z0-9/_+\-]{16,})",
+    re.IGNORECASE)
+
+
+def _roots():
+    # Live root (~/.claude/projects) is always searched — that's where every live
+    # session lives. Extra archive roots (CCDISTILL_ARCHIVE_ROOTS) are additive.
+    r = [LIVE_ROOT] + [Path(p) for p in _EXTRA_ROOTS]
+    return [p for p in r if Path(p).exists()]
+
+
+def _encode_cwd(path: str) -> str:
+    """CC encodes an absolute cwd by replacing / and . with - (leading / → leading -)."""
+    return re.sub(r"[/.]", "-", os.path.abspath(path))
+
+
+def _project_dir_for_cwd(name=None):
+    """Resolve the CC project dir for a named project or the current cwd.
+    For cwd: exact-encode match, else the longest project-name that is a prefix of
+    the encoded cwd (so running inside a subdirectory still maps to its project)."""
+    roots = _roots()
+    if name:
+        # match a project dir whose decoded tail equals `name`
+        cand = []
+        for root in roots:
+            for d in Path(root).iterdir():
+                if d.is_dir() and d.name.rstrip("-").rsplit("-", 1)[-1] == name:
+                    cand.append(d)
+        if cand:
+            return max(cand, key=lambda d: _newest_mtime(d))
+        return None
+    enc = _encode_cwd(os.getcwd())
+    exact, best = None, None
+    for root in roots:
+        for d in Path(root).iterdir():
+            if not d.is_dir():
+                continue
+            if d.name == enc:
+                exact = d
+            elif enc.startswith(d.name) and (best is None or len(d.name) > len(best.name)):
+                best = d
+    return exact or best
+
+
+def _newest_mtime(project_dir: Path) -> float:
+    files = list(project_dir.glob("*.jsonl"))
+    return max((f.stat().st_mtime for f in files), default=0.0)
+
+
+def _session_id_of(jsonl: str, max_lines=50):
+    try:
+        with open(jsonl, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                try:
+                    sid = json.loads(line).get("sessionId")
+                except Exception:
+                    continue
+                if sid:
+                    return sid
+    except Exception:
+        return None
+    return None
+
+
+def _chain_for_session(sid: str, project_dir: Path):
+    """All transcript files for a sessionId (compaction chain), oldest-first."""
+    out = []
+    for f in project_dir.glob("*.jsonl"):
+        if "subagent" in f.name or f.name.startswith("agent-"):
+            continue
+        if _session_id_of(str(f)) == sid:
+            out.append((str(f), f.stat().st_mtime))
+    out.sort(key=lambda x: x[1])
+    return [p for p, _ in out]
+
+
+def _find_session(arg: str):
+    """arg is a .jsonl path OR a session-id. Return (chain, project_dir)."""
+    p = Path(arg)
+    if p.suffix == ".jsonl" and p.exists():
+        sid = _session_id_of(str(p)) or p.stem
+        return _chain_for_session(sid, p.parent), p.parent
+    for root in _roots():
+        for d in Path(root).iterdir():
+            if not d.is_dir():
+                continue
+            for f in d.glob("*.jsonl"):
+                if f.stem == arg or _session_id_of(str(f)) == arg:
+                    sid = _session_id_of(str(f)) or f.stem
+                    return _chain_for_session(sid, d), d
+    return [], None
+
+
+def _recent_sessions(project_dir: Path, limit=15):
+    rows = []
+    for f in project_dir.glob("*.jsonl"):
+        if "subagent" in f.name or f.name.startswith("agent-"):
+            continue
+        rows.append((f, f.stat().st_mtime))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:limit]
+
+
+def _first_user_title(jsonl: str) -> str:
+    try:
+        for line in open(jsonl, encoding="utf-8", errors="replace"):
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "user":
+                continue
+            c = (o.get("message") or {}).get("content")
+            t = c if isinstance(c, str) else " ".join(
+                b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"
+            ) if isinstance(c, list) else ""
+            t = " ".join(t.split())
+            if t and not any(m in t for m in _NOISE):
+                return t[:70]
+    except Exception:
+        pass
+    return "(no title)"
+
+
+def _scope_rows(project=None, all_projects=False, limit=20):
+    """Recent sessions for a scope, newest-first: list of (path, mtime, project_dir)."""
+    if all_projects:
+        rows = []
+        for root in _roots():
+            for d in Path(root).iterdir():
+                if d.is_dir():
+                    rows += [(f, m, d) for f, m in _recent_sessions(d, 40)]
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return rows[:limit], None
+    pd = _project_dir_for_cwd(project)
+    if pd is None:
+        return [], None
+    return [(f, m, pd) for f, m in _recent_sessions(pd, limit)], pd
+
+
+def _emit_list(rows, as_json):
+    """Non-interactive session discovery for agents/scripts. Each row's `id` is what
+    you pass back to `ccdistill <id>`. TSV by default (id, modified, size, project,
+    title); JSON with --json. `size_kb` is a free proxy for how substantial a session
+    is — an agent can skip a tiny just-started session (e.g. its own)."""
+    import datetime as _dt
+    items = []
+    for f, m, d in rows:
+        items.append({
+            "id": Path(f).stem,
+            "modified": _dt.datetime.fromtimestamp(m).isoformat(timespec="minutes"),
+            "project": d.name.rsplit("-", 1)[-1],
+            "size_kb": Path(f).stat().st_size // 1024,
+            "title": _first_user_title(str(f)),
+        })
+    if as_json:
+        print(json.dumps(items, indent=2))
+    else:
+        for it in items:
+            print(f'{it["id"]}\t{it["modified"]}\t{it["size_kb"]:>6} KB\t'
+                  f'{it["project"]:<16}\t{it["title"]}')
+
+
+# ---- tool_use → one-line intent stub -----------------------------------------
+_TOOL_KEY = {
+    "Bash": "command", "Edit": "file_path", "MultiEdit": "file_path",
+    "Write": "file_path", "Read": "file_path", "NotebookEdit": "notebook_path",
+    "Grep": "pattern", "Glob": "pattern", "Task": "description",
+    "WebSearch": "query", "WebFetch": "url", "Skill": "command",
+    "TodoWrite": None,  # noise
+}
+
+
+def _tool_stub(name: str, inp: dict) -> str | None:
+    if not isinstance(inp, dict):
+        return f"⏺ {name}"
+    key = _TOOL_KEY.get(name, "__auto__")
+    if key is None:
+        return None
+    if key == "__auto__":
+        for k in ("command", "file_path", "path", "pattern", "query", "url",
+                  "description", "prompt", "cypher", "content"):
+            if k in inp:
+                key = k
+                break
+        else:
+            key = next(iter(inp), None)
+    val = inp.get(key, "") if key else ""
+    val = " ".join(str(val).split())
+    if len(val) > 110:
+        val = val[:110] + "…"
+    return f"⏺ {name}: {val}" if val else f"⏺ {name}"
+
+
+# ---- distillation ------------------------------------------------------------
+def distill(chain, keep_thinking=True, thinking_chars=700):
+    turns = []
+    for jsonl in chain:
+        try:
+            fh = open(jsonl, encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") not in ("user", "assistant"):
+                    continue          # drops attachment/system/snapshot/... = CLAUDE.md+reminders
+                if o.get("isSidechain") or o.get("isCompactSummary"):
+                    continue
+                msg = o.get("message") or {}
+                cont = msg.get("content")
+                role = USER_LABEL if o.get("type") == "user" else "Claude"
+                pieces = []
+                if isinstance(cont, str):
+                    t = cont.strip()
+                    if t and not any(m in t for m in _NOISE):
+                        pieces.append(t)
+                elif isinstance(cont, list):
+                    for b in cont:
+                        if not isinstance(b, dict):
+                            continue
+                        bt = b.get("type")
+                        if bt == "text":
+                            t = (b.get("text") or "").strip()
+                            if t and not any(m in t for m in _NOISE):
+                                pieces.append(t)
+                        elif bt == "thinking" and keep_thinking:
+                            th = " ".join((b.get("thinking") or "").split())
+                            if th:
+                                if len(th) > thinking_chars:
+                                    th = th[:thinking_chars] + " […]"
+                                pieces.append(f"> 💭 {th}")
+                        elif bt == "tool_use":
+                            stub = _tool_stub(b.get("name", "?"), b.get("input"))
+                            if stub:
+                                pieces.append(stub)
+                        # tool_result → dropped (bulky output; the tool_use stub carries intent)
+                if pieces:
+                    turns.append((role, "\n".join(pieces)))
+    return turns
+
+
+def _est_tokens(s: str) -> int:
+    return max(1, len(s) // 4)
+
+
+HEADER = """\
+<!-- Distilled by ccdistill — tool OUTPUTS were stripped and may be STALE. -->
+You are resuming interrupted work in a NEW session. Below is a distilled brief of the
+prior session: human + assistant messages, the assistant's reasoning, and which tools
+were called and why. Tool OUTPUTS, injected CLAUDE.md, and system-reminders were removed.
+
+BEFORE taking any action, establish ground truth from the repo — do NOT trust the
+brief's implied state:
+  1. `git status --short`      (uncommitted work-in-progress)
+  2. `git log --oneline -15`   (what actually landed)
+  3. `git diff --stat HEAD`    (changed but uncommitted)
+  4. run the test/build command (current red/green state)
+  5. read any TODO / HANDOFF / plan files on disk
+
+Then reconcile: which brief claims are CONFIRMED by repo state, which are CONTRADICTED
+(the repo WINS), which are UNVERIFIABLE. State that reconciliation, then continue from
+the prior next-step — do NOT restart completed work. Ask only if something load-bearing
+is genuinely missing.
+
+---
+"""
+
+
+def render(turns, chain, project_dir, with_header=True, with_meta=True):
+    body = "\n\n".join(f"### {role}\n{text}" for role, text in turns)
+    out = []
+    if with_header:
+        out.append(HEADER)
+    if with_meta:
+        proj = project_dir.name.rsplit("-", 1)[-1] if project_dir else "?"
+        sid = Path(chain[0]).stem if chain else "?"
+        # date range + git branch from the transcript
+        first_ts = last_ts = branch = ""
+        try:
+            for line in open(chain[0], encoding="utf-8", errors="replace"):
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                ts = (o.get("timestamp") or "")[:16]
+                if ts and not first_ts:
+                    first_ts = ts
+                if ts:
+                    last_ts = ts
+                branch = branch or o.get("gitBranch") or ""
+        except Exception:
+            pass
+        out.append(
+            f"**Project:** {proj}  •  **Session:** {sid}  •  **Files in chain:** "
+            f"{len(chain)}  •  **Turns kept:** {len(turns)}\n"
+            f"**Span:** {first_ts} → {last_ts}  •  **Branch:** {branch or '?'}\n"
+        )
+    out.append(body)
+    return "\n".join(out).strip() + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="Distill a CC session into a resume brief.")
+    ap.add_argument("session", nargs="?", help="session-id or path/to.jsonl (default: newest in cwd's project)")
+    ap.add_argument("-o", dest="out", help="write to FILE instead of stdout")
+    ap.add_argument("--pick", action="store_true", help="numbered picker of recent sessions")
+    ap.add_argument("--project", help="select within a named project instead of cwd")
+    ap.add_argument("--all-projects", action="store_true", help="with --pick, list across all projects")
+    ap.add_argument("--no-thinking", action="store_true")
+    ap.add_argument("--thinking-chars", type=int, default=700)
+    ap.add_argument("--no-header", action="store_true")
+    ap.add_argument("--raw", action="store_true", help="transcript only (no header, no metadata)")
+    ap.add_argument("--list", action="store_true",
+                    help="list recent sessions (non-interactive — for agents/scripts); id → `ccdistill <id>`")
+    ap.add_argument("--json", action="store_true", help="with --list: emit JSON instead of TSV")
+    ap.add_argument("--limit", type=int, default=20, help="with --list: max rows (default 20)")
+    a = ap.parse_args()
+
+    # --list: non-interactive discovery for agents/scripts (id → `ccdistill <id>`)
+    if a.list:
+        rows, _ = _scope_rows(a.project, a.all_projects, limit=a.limit)
+        if not rows:
+            print("ccdistill: no sessions found for this scope.", file=sys.stderr)
+            sys.exit(1)
+        _emit_list(rows, a.json)
+        return
+
+    chain, project_dir = [], None
+
+    if a.session:
+        chain, project_dir = _find_session(a.session)
+        if not chain:
+            print(f"ccdistill: no session found for '{a.session}'", file=sys.stderr)
+            sys.exit(1)
+    else:
+        rows, project_dir = _scope_rows(a.project, a.all_projects and a.pick)
+        if not rows:
+            print("ccdistill: no CC sessions for this cwd; pass a session-id, --project NAME, or --list",
+                  file=sys.stderr)
+            sys.exit(1)
+        if a.pick:
+            if not sys.stdin.isatty():
+                print("ccdistill: --pick needs an interactive terminal. For agents/scripts run "
+                      "`ccdistill --list [--json]` to get ids, then `ccdistill <id>`.", file=sys.stderr)
+                sys.exit(2)
+            import datetime as _dt
+            for i, (f, m, d) in enumerate(rows, 1):
+                age = _dt.datetime.fromtimestamp(m).strftime("%b %d %H:%M")
+                print(f"  [{i:2}] {age}  {d.name.rsplit('-', 1)[-1]:<16} {_first_user_title(str(f))}",
+                      file=sys.stderr)
+            try:
+                f, _, d = rows[int(input("pick #: ").strip()) - 1]
+            except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+                print("ccdistill: cancelled.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            f, _, d = rows[0]
+        sid = _session_id_of(str(f)) or f.stem
+        chain, project_dir = _chain_for_session(sid, d), d
+
+    # schema-version sanity (warn only — parser is defensive)
+    ver = ""
+    try:
+        ver = json.loads(next(open(chain[0], encoding="utf-8", errors="replace"))).get("version", "")
+    except Exception:
+        pass
+    if ver and not ver.startswith(KNOWN_VERSION_PREFIX):
+        print(f"ccdistill: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
+              f"schema may have drifted, review output.", file=sys.stderr)
+
+    turns = distill(chain, keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars)
+    if not turns:
+        print("ccdistill: session had no distillable content.", file=sys.stderr)
+        sys.exit(1)
+
+    text = render(turns, chain, project_dir,
+                  with_header=not (a.no_header or a.raw),
+                  with_meta=not a.raw)
+
+    if _SECRET_RE.search(text):
+        print("ccdistill: ⚠ possible secret in output (a tool input may contain a key) — review before sharing.",
+              file=sys.stderr)
+
+    raw_bytes = sum(os.path.getsize(f) for f in chain if os.path.exists(f))
+    out_bytes = len(text.encode("utf-8"))
+    ratio = raw_bytes / out_bytes if out_bytes else 0
+    print(f"ccdistill: {len(chain)} file(s), {len(turns)} turns  •  "
+          f"{raw_bytes//1024} KB → {out_bytes//1024} KB (~{ratio:.1f}× smaller, "
+          f"~{_est_tokens(text):,} tokens)", file=sys.stderr)
+
+    if a.out:
+        Path(a.out).write_text(text, encoding="utf-8")
+        print(f"ccdistill: wrote {a.out}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
