@@ -157,11 +157,13 @@ def _chain_for_session(sid: str, project_dir: Path):
 
 
 def _find_session(arg: str):
-    """arg is a .jsonl path OR a session-id. Return (chain, project_dir)."""
+    """arg is a .jsonl path OR a session-id (full UUID or unique short prefix).
+    Return (chain, project_dir)."""
     p = Path(arg)
     if p.suffix == ".jsonl" and p.exists():
         sid = _session_id_of(str(p)) or p.stem
         return _chain_for_session(sid, p.parent), p.parent
+    # 1) exact match on filename stem or in-file sessionId
     for root in _roots():
         for d in Path(root).iterdir():
             if not d.is_dir():
@@ -170,6 +172,31 @@ def _find_session(arg: str):
                 if f.stem == arg or _session_id_of(str(f)) == arg:
                     sid = _session_id_of(str(f)) or f.stem
                     return _chain_for_session(sid, d), d
+    # 2) unique-prefix match (git-style short ids; CC names files by session UUID)
+    matches = {}  # sid -> (project_dir, mtime)
+    for root in _roots():
+        rp = Path(root)
+        if not rp.is_dir():
+            continue
+        for d in rp.iterdir():
+            if not d.is_dir():
+                continue
+            for f in d.glob(f"{arg}*.jsonl"):
+                if "subagent" in f.name or f.name.startswith("agent-"):
+                    continue
+                sid = _session_id_of(str(f)) or f.stem
+                mt = f.stat().st_mtime
+                if sid not in matches or mt > matches[sid][1]:
+                    matches[sid] = (d, mt)
+    if len(matches) == 1:
+        sid, (d, _mt) = next(iter(matches.items()))
+        return _chain_for_session(sid, d), d
+    if len(matches) > 1:
+        lines = [f"ccdistill: '{arg}' is ambiguous — {len(matches)} sessions match:"]
+        for sid, (d, _mt) in sorted(matches.items(), key=lambda kv: kv[1][1], reverse=True)[:8]:
+            lines.append(f"  {sid}  ({d.name})")
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(2)
     return [], None
 
 
