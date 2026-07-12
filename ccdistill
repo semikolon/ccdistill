@@ -18,6 +18,7 @@ Usage:
   ccdistill                     # newest session in the current dir's project
   ccdistill <session-id>        # a specific session (searched across all roots)
   ccdistill <path/to.jsonl>     # a specific transcript file
+  ccdistill "<title words>"     # a session by its (Claude Desktop) title, substring match
   ccdistill --list [--json]     # discover recent sessions (non-interactive; for agents)
   ccdistill --pick              # interactive numbered picker (human terminal only)
   ccdistill --project <name>    # newest session in a named project
@@ -50,6 +51,11 @@ Env:
 
 Notes:
   - Handles the compaction chain (multiple files sharing one sessionId).
+  - A project can live in SEVERAL dirs at once (live root + archive roots): all
+    matching dirs are unioned, deduped by session id (newest copy wins) — an
+    archive root must never shadow live sessions.
+  - Session titles from the Claude Desktop app (claude-code-sessions metadata)
+    are joined into --list/--pick and matchable as a positional arg.
   - Dodges the stale-transcript-path bug by resolving via sessionId + newest mtime.
   - Skips subagent/sidechain turns, compaction summaries, and all metadata line types
     (attachment/system/file-history-snapshot/permission-mode/...), which is where
@@ -94,31 +100,37 @@ def _encode_cwd(path: str) -> str:
     return re.sub(r"[/.]", "-", os.path.abspath(path))
 
 
-def _project_dir_for_cwd(name=None):
-    """Resolve the CC project dir for a named project or the current cwd.
-    For cwd: exact-encode match, else the longest project-name that is a prefix of
-    the encoded cwd (so running inside a subdirectory still maps to its project)."""
+def _project_dirs(name=None):
+    """Resolve ALL CC project dirs for a named project or the current cwd, across
+    every root (live first). A project routinely exists in several dirs at once —
+    the live root plus archive roots — and picking just one silently hides the
+    rest (the bug this replaced: an archive root's exact match shadowed the live
+    dir, so --list showed only archived sessions).
+    For cwd: exact-encode matches from every root; if none anywhere, the longest
+    project-name that is a prefix of the encoded cwd, per root (so running inside
+    a subdirectory still maps to its project)."""
     roots = _roots()
     if name:
-        # match a project dir whose decoded tail equals `name`
-        cand = []
+        # match project dirs whose decoded tail equals `name`, in root order
+        out = []
         for root in roots:
-            for d in Path(root).iterdir():
+            for d in sorted(Path(root).iterdir()):
                 if d.is_dir() and d.name.rstrip("-").rsplit("-", 1)[-1] == name:
-                    cand.append(d)
-        if cand:
-            return max(cand, key=lambda d: _newest_mtime(d))
-        return None
+                    out.append(d)
+        return out
     enc = _encode_cwd(os.getcwd())
-    exact, best = None, None
+    exact, best = [], []
     for root in roots:
+        root_best = None
         for d in Path(root).iterdir():
             if not d.is_dir():
                 continue
             if d.name == enc:
-                exact = d
-            elif enc.startswith(d.name) and (best is None or len(d.name) > len(best.name)):
-                best = d
+                exact.append(d)
+            elif enc.startswith(d.name) and (root_best is None or len(d.name) > len(root_best.name)):
+                root_best = d
+        if root_best is not None:
+            best.append(root_best)
     return exact or best
 
 
@@ -144,21 +156,69 @@ def _session_id_of(jsonl: str, max_lines=50):
     return None
 
 
-def _chain_for_session(sid: str, project_dir: Path):
-    """All transcript files for a sessionId (compaction chain), oldest-first."""
-    out = []
-    for f in project_dir.glob("*.jsonl"):
-        if "subagent" in f.name or f.name.startswith("agent-"):
-            continue
-        if _session_id_of(str(f)) == sid:
-            out.append((str(f), f.stat().st_mtime))
-    out.sort(key=lambda x: x[1])
+def _chain_for_session(sid: str, project_dirs):
+    """All transcript files for a sessionId (compaction chain) across the given
+    project dirs, oldest-first. Deduped by file stem — if the same transcript
+    exists in both a live and an archive dir, the newest copy wins."""
+    if isinstance(project_dirs, Path):
+        project_dirs = [project_dirs]
+    seen = {}  # stem -> (path, mtime)
+    for pd in project_dirs:
+        for f in pd.glob("*.jsonl"):
+            if "subagent" in f.name or f.name.startswith("agent-"):
+                continue
+            if _session_id_of(str(f)) == sid:
+                mt = f.stat().st_mtime
+                if f.stem not in seen or mt > seen[f.stem][1]:
+                    seen[f.stem] = (str(f), mt)
+    out = sorted(seen.values(), key=lambda x: x[1])
     return [p for p, _ in out]
 
 
+_CCD_SESSIONS_ROOT = HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+_ccd_titles_cache = None
+
+
+def _ccd_titles():
+    """cliSessionId (= JSONL stem) -> user-visible session title, from the Claude
+    Desktop app's per-session metadata JSONs. Empty dict when the app isn't
+    installed or the layout drifts — everything degrades to first-user-message."""
+    global _ccd_titles_cache
+    if _ccd_titles_cache is not None:
+        return _ccd_titles_cache
+    titles = {}
+    try:
+        for f in _CCD_SESSIONS_ROOT.glob("*/*/*.json"):
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    o = json.load(fh)
+                sid, title = o.get("cliSessionId"), o.get("title")
+                if sid and title:
+                    titles[sid] = " ".join(str(title).split())
+            except Exception:
+                continue
+    except Exception:
+        pass
+    _ccd_titles_cache = titles
+    return titles
+
+
+def _dirs_containing_session(sid: str):
+    """All project dirs (across all roots) holding transcript files for sid."""
+    dirs = []
+    for root in _roots():
+        for d in Path(root).iterdir():
+            if not d.is_dir():
+                continue
+            if any(_session_id_of(str(f)) == sid or f.stem == sid
+                   for f in d.glob(f"{sid[:8]}*.jsonl")):
+                dirs.append(d)
+    return dirs
+
+
 def _find_session(arg: str):
-    """arg is a .jsonl path OR a session-id (full UUID or unique short prefix).
-    Return (chain, project_dir)."""
+    """arg is a .jsonl path, a session-id (full UUID or unique short prefix), or a
+    (Claude Desktop) session-title substring. Return (chain, project_dir)."""
     p = Path(arg)
     if p.suffix == ".jsonl" and p.exists():
         sid = _session_id_of(str(p)) or p.stem
@@ -171,7 +231,8 @@ def _find_session(arg: str):
             for f in d.glob("*.jsonl"):
                 if f.stem == arg or _session_id_of(str(f)) == arg:
                     sid = _session_id_of(str(f)) or f.stem
-                    return _chain_for_session(sid, d), d
+                    dirs = _dirs_containing_session(sid) or [d]
+                    return _chain_for_session(sid, dirs), dirs[0]
     # 2) unique-prefix match (git-style short ids; CC names files by session UUID)
     matches = {}  # sid -> (project_dir, mtime)
     for root in _roots():
@@ -188,13 +249,26 @@ def _find_session(arg: str):
                 mt = f.stat().st_mtime
                 if sid not in matches or mt > matches[sid][1]:
                     matches[sid] = (d, mt)
+    # 3) title-substring match against the Claude Desktop session titles
+    #    (the name a human actually knows a session by)
+    if not matches and not re.fullmatch(r"[0-9a-fA-F-]+", arg):
+        needle = arg.lower()
+        for sid, title in _ccd_titles().items():
+            if needle in title.lower():
+                dirs = _dirs_containing_session(sid)
+                if dirs:
+                    matches[sid] = (dirs[0], max(
+                        f.stat().st_mtime for d in dirs for f in d.glob(f"{sid[:8]}*.jsonl")))
     if len(matches) == 1:
         sid, (d, _mt) = next(iter(matches.items()))
-        return _chain_for_session(sid, d), d
+        dirs = _dirs_containing_session(sid) or [d]
+        return _chain_for_session(sid, dirs), dirs[0]
     if len(matches) > 1:
+        titles = _ccd_titles()
         lines = [f"ccdistill: '{arg}' is ambiguous — {len(matches)} sessions match:"]
         for sid, (d, _mt) in sorted(matches.items(), key=lambda kv: kv[1][1], reverse=True)[:8]:
-            lines.append(f"  {sid}  ({d.name})")
+            t = titles.get(sid, "")
+            lines.append(f"  {sid}  ({d.name}){'  ' + t if t else ''}")
         print("\n".join(lines), file=sys.stderr)
         raise SystemExit(2)
     return [], None
@@ -231,20 +305,36 @@ def _first_user_title(jsonl: str) -> str:
     return "(no title)"
 
 
+def _dedupe_rows(rows):
+    """Dedupe (path, mtime, dir) rows by file stem, newest copy wins — the same
+    transcript can exist in both a live and an archive dir."""
+    seen = {}
+    for f, m, d in rows:
+        stem = Path(f).stem
+        if stem not in seen or m > seen[stem][1]:
+            seen[stem] = (f, m, d)
+    out = list(seen.values())
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
 def _scope_rows(project=None, all_projects=False, limit=20):
-    """Recent sessions for a scope, newest-first: list of (path, mtime, project_dir)."""
+    """Recent sessions for a scope, newest-first: list of (path, mtime, project_dir).
+    Unions every matching project dir across all roots (live + archives)."""
     if all_projects:
         rows = []
         for root in _roots():
             for d in Path(root).iterdir():
                 if d.is_dir():
                     rows += [(f, m, d) for f, m in _recent_sessions(d, 40)]
-        rows.sort(key=lambda x: x[1], reverse=True)
-        return rows[:limit], None
-    pd = _project_dir_for_cwd(project)
-    if pd is None:
+        return _dedupe_rows(rows)[:limit], None
+    dirs = _project_dirs(project)
+    if not dirs:
         return [], None
-    return [(f, m, pd) for f, m in _recent_sessions(pd, limit)], pd
+    rows = []
+    for pd in dirs:
+        rows += [(f, m, pd) for f, m in _recent_sessions(pd, limit)]
+    return _dedupe_rows(rows)[:limit], dirs[0]
 
 
 def _emit_list(rows, as_json):
@@ -253,14 +343,16 @@ def _emit_list(rows, as_json):
     title); JSON with --json. `size_kb` is a free proxy for how substantial a session
     is — an agent can skip a tiny just-started session (e.g. its own)."""
     import datetime as _dt
+    titles = _ccd_titles()
     items = []
     for f, m, d in rows:
+        stem = Path(f).stem
         items.append({
-            "id": Path(f).stem,
+            "id": stem,
             "modified": _dt.datetime.fromtimestamp(m).isoformat(timespec="minutes"),
             "project": d.name.rsplit("-", 1)[-1],
             "size_kb": Path(f).stat().st_size // 1024,
-            "title": _first_user_title(str(f)),
+            "title": titles.get(stem) or _first_user_title(str(f)),
         })
     if as_json:
         print(json.dumps(items, indent=2))
@@ -457,9 +549,11 @@ def main():
                       "`ccdistill --list [--json]` to get ids, then `ccdistill <id>`.", file=sys.stderr)
                 sys.exit(2)
             import datetime as _dt
+            titles = _ccd_titles()
             for i, (f, m, d) in enumerate(rows, 1):
                 age = _dt.datetime.fromtimestamp(m).strftime("%b %d %H:%M")
-                print(f"  [{i:2}] {age}  {d.name.rsplit('-', 1)[-1]:<16} {_first_user_title(str(f))}",
+                label = titles.get(Path(f).stem) or _first_user_title(str(f))
+                print(f"  [{i:2}] {age}  {d.name.rsplit('-', 1)[-1]:<16} {label}",
                       file=sys.stderr)
             try:
                 f, _, d = rows[int(input("pick #: ").strip()) - 1]
@@ -469,7 +563,8 @@ def main():
         else:
             f, _, d = rows[0]
         sid = _session_id_of(str(f)) or f.stem
-        chain, project_dir = _chain_for_session(sid, d), d
+        dirs = _dirs_containing_session(sid) or [d]
+        chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
 
     # schema-version sanity (warn only — parser is defensive)
     ver = ""
