@@ -108,7 +108,30 @@ stale-transcript-path-on-continued-sessions behavior.
 --thinking-chars N truncate each thinking block to N chars (default 700)
 --no-header        omit the repo-verify resume header
 --raw              transcript only (no header, no metadata)
+--since WHEN       keep turns at/after WHEN (YYYY-MM-DD or ISO 8601, your local time)
+--until WHEN       keep turns at/before WHEN (a bare date means end of that day)
+--last N           keep only the last N turns (applied after --since/--until)
+--level user       human turns + assistant tool-call intents only (drops assistant prose)
 ```
+
+### Reading a very long session
+
+Distillation is ~70× — but a session that ran for weeks can still land at hundreds of
+thousands of tokens, which is more than you want to spend in one context. The last four
+options slice it. Measured on a real 6 607-turn, 30-day session:
+
+| invocation | output |
+|---|---|
+| `ccdistill <id>` | ~580k tokens |
+| `ccdistill <id> --level user` | ~221k — the arc: what the human asked, what the machine did |
+| `ccdistill <id> --since 2026-08-04` | ~265k |
+| `ccdistill <id> --since 2026-08-04 --level user` | ~98k |
+| `ccdistill <id> --last 40` | ~4k — where it left off |
+
+Any slice prints a **PARTIAL VIEW** banner naming the window and the kept/total turn
+count, so a partial read is never mistaken for the whole session. `--since`/`--until` are
+parsed in *your* local time and converted to UTC before comparing against the transcript's
+UTC timestamps — a raw comparison would quietly shift every boundary by your offset.
 
 ### Environment
 

@@ -394,7 +394,10 @@ def _tool_stub(name: str, inp: dict) -> str | None:
 
 
 # ---- distillation ------------------------------------------------------------
-def distill(chain, keep_thinking=True, thinking_chars=700):
+def distill(chain, keep_thinking=True, thinking_chars=700, level="full"):
+    """level='full' keeps everything; level='user' keeps the human's turns plus the
+    assistant's tool-call intents only (drops assistant prose + thinking) — the
+    cheap arc-only view for very long sessions."""
     turns = []
     for jsonl in chain:
         try:
@@ -424,11 +427,14 @@ def distill(chain, keep_thinking=True, thinking_chars=700):
                         if not isinstance(b, dict):
                             continue
                         bt = b.get("type")
+                        lean = level == "user" and role != USER_LABEL
                         if bt == "text":
+                            if lean:
+                                continue
                             t = (b.get("text") or "").strip()
                             if t and not any(m in t for m in _NOISE):
                                 pieces.append(t)
-                        elif bt == "thinking" and keep_thinking:
+                        elif bt == "thinking" and keep_thinking and not lean:
                             th = " ".join((b.get("thinking") or "").split())
                             if th:
                                 if len(th) > thinking_chars:
@@ -440,7 +446,36 @@ def distill(chain, keep_thinking=True, thinking_chars=700):
                                 pieces.append(stub)
                         # tool_result → dropped (bulky output; the tool_use stub carries intent)
                 if pieces:
-                    turns.append((role, "\n".join(pieces)))
+                    turns.append((role, "\n".join(pieces), (o.get("timestamp") or "")[:19]))
+    return turns
+
+
+def _parse_bound(s, end_of_day=False):
+    """Parse YYYY-MM-DD or an ISO datetime as LOCAL time and return a UTC string
+    comparable to the JSONL timestamps (which are UTC). Mixing zones here would
+    silently shift every boundary by the local offset."""
+    import datetime as _dt
+    s = (s or "").strip()
+    try:
+        d = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        raise SystemExit(f"ccdistill: cannot parse {s!r} — use YYYY-MM-DD or ISO 8601")
+    if len(s) == 10 and end_of_day:
+        d = d.replace(hour=23, minute=59, second=59)
+    if d.tzinfo is None:
+        d = d.astimezone()                      # naive input = the user's local clock
+    return d.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def window(turns, since=None, until=None, last=None):
+    """Slice a distilled session: --since/--until by wall-clock, --last by turn count."""
+    lo = _parse_bound(since) if since else None
+    hi = _parse_bound(until, end_of_day=True) if until else None
+    if lo or hi:
+        turns = [t for t in turns
+                 if (not t[2]) or ((not lo or t[2] >= lo) and (not hi or t[2] <= hi))]
+    if last and last > 0:
+        turns = turns[-last:]
     return turns
 
 
@@ -471,8 +506,8 @@ is genuinely missing.
 """
 
 
-def render(turns, chain, project_dir, with_header=True, with_meta=True):
-    body = "\n\n".join(f"### {role}\n{text}" for role, text in turns)
+def render(turns, chain, project_dir, with_header=True, with_meta=True, slice_note=""):
+    body = "\n\n".join(f"### {role}\n{text}" for role, text, *_ in turns)
     out = []
     if with_header:
         out.append(HEADER)
@@ -499,6 +534,8 @@ def render(turns, chain, project_dir, with_header=True, with_meta=True):
             f"**Project:** {proj}  •  **Session:** {sid}  •  **Files in chain:** "
             f"{len(chain)}  •  **Turns kept:** {len(turns)}\n"
             f"**Span:** {first_ts} → {last_ts}  •  **Branch:** {branch or '?'}\n"
+            + (f"\n> ⚠ **PARTIAL VIEW — {slice_note}.** This is a slice of the session, "
+               f"not the whole thing; anything outside it is unread.\n" if slice_note else "")
         )
     out.append(body)
     return "\n".join(out).strip() + "\n"
@@ -519,6 +556,15 @@ def main():
                     help="list recent sessions (non-interactive — for agents/scripts); id → `ccdistill <id>`")
     ap.add_argument("--json", action="store_true", help="with --list: emit JSON instead of TSV")
     ap.add_argument("--limit", type=int, default=20, help="with --list: max rows (default 20)")
+    ap.add_argument("--since", metavar="WHEN",
+                    help="keep turns at/after WHEN (YYYY-MM-DD or ISO 8601, YOUR local time)")
+    ap.add_argument("--until", metavar="WHEN",
+                    help="keep turns at/before WHEN (bare date = end of that day, local time)")
+    ap.add_argument("--last", type=int, metavar="N",
+                    help="keep only the last N turns (applied after --since/--until)")
+    ap.add_argument("--level", choices=("full", "user"), default="full",
+                    help="'user' = human turns + assistant tool-call intents only "
+                         "(drops assistant prose/thinking) — the cheap arc view for huge sessions")
     a = ap.parse_args()
 
     # --list: non-interactive discovery for agents/scripts (id → `ccdistill <id>`)
@@ -576,14 +622,30 @@ def main():
         print(f"ccdistill: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
               f"schema may have drifted, review output.", file=sys.stderr)
 
-    turns = distill(chain, keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars)
+    turns = distill(chain, keep_thinking=not a.no_thinking,
+                    thinking_chars=a.thinking_chars, level=a.level)
     if not turns:
         print("ccdistill: session had no distillable content.", file=sys.stderr)
         sys.exit(1)
 
+    total = len(turns)
+    if a.since or a.until or a.last:
+        turns = window(turns, since=a.since, until=a.until, last=a.last)
+        if not turns:
+            print("ccdistill: the requested window contains no turns.", file=sys.stderr)
+            sys.exit(1)
+
+    bits = []
+    if a.since:  bits.append(f"since {a.since}")
+    if a.until:  bits.append(f"until {a.until}")
+    if a.last:   bits.append(f"last {a.last} turns")
+    if a.level != "full": bits.append("level=user (assistant prose dropped, tool-call intents kept)")
+    slice_note = ", ".join(bits) + f" — {len(turns)} of {total} turns" if bits else ""
+
     text = render(turns, chain, project_dir,
                   with_header=not (a.no_header or a.raw),
-                  with_meta=not a.raw)
+                  with_meta=not a.raw,
+                  slice_note=slice_note)
 
     if _SECRET_RE.search(text):
         print("ccdistill: ⚠ possible secret in output (a tool input may contain a key) — review before sharing.",
