@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ccdistill — distill a Claude Code session JSONL into a lean resume brief.
+ccdistill — distill a Claude Code or Codex session transcript into a lean resume brief.
 
 Purpose:
   Resuming a large, cold (>cache-TTL) CC session with `claude --resume` reprocesses
