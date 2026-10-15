@@ -1,6 +1,6 @@
 # ccdistill
 
-**Distill a [Claude Code](https://code.claude.com) session transcript into a lean resume brief.**
+**Distill a [Claude Code](https://code.claude.com) (or Codex) session transcript into a lean resume brief.**
 
 Resuming a large, stale session with `claude --resume` reprocesses the *entire*
 transcript as fresh input on the first turn — one of the most expensive requests you
@@ -80,6 +80,25 @@ ccdistill --list --json       # [{id, modified, project, size_kb, title, ...}]
 
 Pick an `id` (the `size_kb` field hints how substantial a session is — skip a tiny
 just-started one, e.g. the agent's own current session), then `ccdistill <id>`.
+
+## Codex sessions
+
+The same program reads [OpenAI Codex](https://developers.openai.com/codex) transcripts
+(`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). Install it under a second name and that
+name defaults to Codex:
+
+```bash
+ln -s ccdistill ~/.local/bin/codexdistill
+codexdistill                  # newest Codex session for the current dir
+codexdistill --list           # recent Codex sessions (thread names from session_index.jsonl)
+codexdistill <id>             # a specific session; a unique id prefix is enough
+```
+
+Under either name, a path or id is read in whatever format it is. Codex runs shell
+through a JavaScript `exec` tool, so tool intents show as `⏺ exec: <shell command>`, and
+file edits happen inside those commands. Codex keeps its reasoning encrypted; only its
+short reasoning summaries survive. A subagent's own transcript holds no request (its task
+arrives through the parent's spawn call), so it is listed as a subagent of its parent.
 
 ## What it keeps vs drops
 

@@ -49,6 +49,15 @@ Env:
   CCDISTILL_ARCHIVE_ROOTS  extra transcript roots (os.pathsep-separated) beyond
                            ~/.claude/projects — e.g. an archive volume
 
+Codex sessions (OpenAI Codex CLI / desktop):
+  The same program reads Codex transcripts (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
+  Installed under a second name, `codexdistill` (a symlink), it defaults to Codex:
+  `codexdistill` = newest Codex session for this dir, `codexdistill --list` lists them.
+  Under either name a path or session id is read in whatever format it is.
+  Codex runs shell through a JS `exec` tool, so tool intents show as
+  `⏺ exec: <shell command>`; file edits happen inside those commands. Codex keeps
+  its reasoning encrypted, so only its short reasoning summaries survive.
+
 Notes:
   - Handles the compaction chain (multiple files sharing one sessionId).
   - A project can live in SEVERAL dirs at once (live root + archive roots): all
@@ -75,6 +84,10 @@ LIVE_ROOT = HOME / ".claude" / "projects"
 _EXTRA_ROOTS = [p for p in os.environ.get("CCDISTILL_ARCHIVE_ROOTS", "").split(os.pathsep) if p.strip()]
 USER_LABEL = os.environ.get("CCDISTILL_USER_LABEL", "User")   # label for the human's turns
 KNOWN_VERSION_PREFIX = "2."          # warn (don't fail) outside this major line
+PROG = Path(sys.argv[0]).name or "ccdistill"
+CODEX_DEFAULT = PROG.startswith("codex")   # installed as `codexdistill` → Codex is the default store
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
+CODEX_ROOTS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
 
 # text blocks defensively skipped if an older-version session inlines boilerplate
 _NOISE = ("<system-reminder>", "Codebase and user instructions are shown below",
@@ -346,13 +359,18 @@ def _emit_list(rows, as_json):
     titles = _ccd_titles()
     items = []
     for f, m, d in rows:
-        stem = Path(f).stem
+        if isinstance(d, str):        # a Codex row carries its project name, not a dir
+            sid = _codex_id(f)
+            project, title = d, _codex_titles().get(sid) or _codex_first_request(f)
+        else:
+            sid = Path(f).stem
+            project, title = d.name.rsplit("-", 1)[-1], titles.get(sid) or _first_user_title(str(f))
         items.append({
-            "id": stem,
+            "id": sid,
             "modified": _dt.datetime.fromtimestamp(m).isoformat(timespec="minutes"),
-            "project": d.name.rsplit("-", 1)[-1],
+            "project": project,
             "size_kb": Path(f).stat().st_size // 1024,
-            "title": titles.get(stem) or _first_user_title(str(f)),
+            "title": title,
         })
     if as_json:
         print(json.dumps(items, indent=2))
@@ -450,6 +468,282 @@ def distill(chain, keep_thinking=True, thinking_chars=700, level="full"):
     return turns
 
 
+# ---- Codex ------------------------------------------------------------------
+# A Codex rollout file is one session: line 1 is `session_meta` (id, cwd, git),
+# then `response_item` records (message / reasoning / custom_tool_call / ...),
+# `event_msg`, `turn_context`, `compacted`. Only response_item carries the
+# conversation; everything else is bookkeeping and is skipped.
+
+# User-role text blocks that are injected context, not something the human typed.
+_CODEX_INJECTED = ("# AGENTS.md instructions", "<environment_context>", "<INSTRUCTIONS>",
+                   "<external_codex_apps_open_page>", "<image", "</image>",
+                   "<user_instructions>", "<turn_aborted>")
+_CODEX_CMD_RE = re.compile(r'"?cmd"?\s*:\s*("(?:[^"\\]|\\.)*")')
+_CODEX_TOOL_RE = re.compile(r"tools\.([A-Za-z_][\w]*)\(")
+
+
+def _codex_files():
+    out = []
+    for root in CODEX_ROOTS:
+        if root.is_dir():
+            out += [p for p in root.rglob("rollout-*.jsonl")]
+    return out
+
+
+def _is_codex(path) -> bool:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return json.loads(fh.readline()).get("type") == "session_meta"
+    except Exception:
+        return False
+
+
+def _codex_meta(path) -> dict:
+    """session_meta payload (id, cwd, timestamp, git, cli_version); {} if unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            o = json.loads(fh.readline())
+        return (o.get("payload") or {}) if o.get("type") == "session_meta" else {}
+    except Exception:
+        return {}
+
+
+def _codex_id(path) -> str:
+    stem = Path(path).stem
+    return _codex_meta(path).get("id") or stem[-36:]
+
+
+_codex_titles_cache = None
+
+
+def _codex_titles():
+    """id -> thread name from ~/.codex/session_index.jsonl (last entry wins)."""
+    global _codex_titles_cache
+    if _codex_titles_cache is None:
+        titles = {}
+        try:
+            for line in open(CODEX_HOME / "session_index.jsonl", encoding="utf-8", errors="replace"):
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("id") and o.get("thread_name"):
+                    titles[o["id"]] = " ".join(str(o["thread_name"]).split())
+        except Exception:
+            pass
+        _codex_titles_cache = titles
+    return _codex_titles_cache
+
+
+def _codex_in_scope(session_cwd: str, here: str) -> bool:
+    """A Codex session belongs to this dir when either is inside the other."""
+    if not session_cwd:
+        return False
+    return here == session_cwd or here.startswith(session_cwd + "/") or session_cwd.startswith(here + "/")
+
+
+def _codex_scope_rows(project=None, all_projects=False, limit=20):
+    """Recent Codex sessions, newest-first: list of (path, mtime, project_name)."""
+    here = os.path.abspath(os.getcwd())
+    rows = []
+    for f in _codex_files():
+        cwd = _codex_meta(f).get("cwd", "")
+        if all_projects or (project and Path(cwd).name == project) or (not project and _codex_in_scope(cwd, here)):
+            rows.append((f, f.stat().st_mtime, Path(cwd).name or "?"))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows[:limit]
+
+
+def _codex_find(arg: str):
+    """A Codex rollout path for a path, session id (or unique prefix), or thread-name
+    substring; None when nothing matches."""
+    p = Path(arg)
+    if p.suffix == ".jsonl" and p.exists():
+        return p if _is_codex(p) else None
+    files = _codex_files()
+    hits = [f for f in files if f.stem[-36:] == arg]
+    if not hits:
+        hits = [f for f in files if f.stem[-36:].startswith(arg)] if re.fullmatch(r"[0-9a-fA-F-]{4,}", arg) else []
+    if not hits and not re.fullmatch(r"[0-9a-fA-F-]+", arg):
+        ids = {sid for sid, t in _codex_titles().items() if arg.lower() in t.lower()}
+        hits = [f for f in files if f.stem[-36:] in ids]
+    if len(hits) > 1:
+        titles = _codex_titles()
+        lines = [f"{PROG}: '{arg}' is ambiguous — {len(hits)} Codex sessions match:"]
+        for f in sorted(hits, key=lambda f: f.stat().st_mtime, reverse=True)[:8]:
+            lines.append(f"  {f.stem[-36:]}  {titles.get(f.stem[-36:], '')}")
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(2)
+    return hits[0] if hits else None
+
+
+def _codex_subagent(meta: dict) -> str:
+    """'subagent <nickname> (<task path>) of <parent id>' for a Codex subagent, else ''.
+    A subagent's task arrives through its parent's spawn call, so its own file has no
+    user turn; the parent's transcript holds the request."""
+    if meta.get("thread_source") != "subagent":
+        return ""
+    name = meta.get("agent_nickname") or "?"
+    task = (meta.get("agent_path") or "").rsplit("/", 1)[-1]
+    parent = meta.get("parent_thread_id") or meta.get("session_id") or "?"
+    return f"subagent {name}" + (f" ({task})" if task else "") + f" of {parent}"
+
+
+def _codex_first_request(path) -> str:
+    sub = _codex_subagent(_codex_meta(path))
+    if sub:
+        return "[" + sub + "]"
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            p = o.get("payload") or {}
+            if o.get("type") == "response_item" and p.get("type") == "message" and p.get("role") == "user":
+                t = " ".join(_codex_user_text(p.get("content")).split())
+                if t:
+                    return t[:70]
+    except Exception:
+        pass
+    return "(no title)"
+
+
+def _codex_user_text(content) -> str:
+    """What the human typed: injected AGENTS.md / environment / image blocks dropped;
+    the desktop app's attachment wrapper reduced to the request plus the file names
+    and any annotated passages it quotes."""
+    out = []
+    for b in content or []:
+        if not isinstance(b, dict) or b.get("type") != "input_text":
+            continue
+        t = b.get("text") or ""
+        s = t.strip()
+        if not s or s.startswith(_CODEX_INJECTED):
+            continue
+        if "## My request:" in t:
+            head, req = t.split("## My request:", 1)
+            pre = []
+            names = re.findall(r"^## (.+?): /", head, re.M)
+            if names:
+                pre.append("[attached: " + ", ".join(names) + "]")
+            ann = re.search(r"<response-annotations>\s*(.*?)\s*</response-annotations>", head, re.S)
+            if ann:
+                try:
+                    for item in json.loads(ann.group(1)):
+                        quote = " ".join(str(item.get("text", "")).split())[:200]
+                        note = item.get("comment") or ""
+                        pre.append(f"[on «{quote}»" + (f": {note}" if note else "") + "]")
+                except Exception:
+                    pass
+            s = "\n".join(pre + [req.strip()])
+        out.append(s)
+    return "\n".join(out).strip()
+
+
+def _codex_commands(script: str):
+    """Shell commands inside a Codex `exec` script, in order."""
+    cmds = []
+    for m in _CODEX_CMD_RE.finditer(script or ""):
+        try:
+            cmds.append(json.loads(m.group(1)))
+        except Exception:
+            continue
+    return cmds
+
+
+def _codex_tool_stubs(script: str):
+    stubs = []
+    for c in _codex_commands(script):
+        val = " ".join(str(c).split())
+        stubs.append("⏺ exec: " + (val[:110] + "…" if len(val) > 110 else val))
+    others = [n for n in _CODEX_TOOL_RE.findall(script or "") if n not in ("exec_command", "write_stdin")]
+    stubs += [f"⏺ {n}" for n in dict.fromkeys(others)]
+    if not stubs and (script or "").strip():
+        val = " ".join(script.split())
+        stubs.append("⏺ exec (script): " + (val[:110] + "…" if len(val) > 110 else val))
+    return stubs
+
+
+def distill_codex(path, keep_thinking=True, thinking_chars=700, level="full"):
+    """Codex rollout → the same (role, text, ts) turn list `distill` returns."""
+    turns = []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except Exception:
+        return turns
+    lean = level == "user"
+    with fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "response_item":
+                continue          # session_meta/event_msg/turn_context/compacted/world_state
+            p = o.get("payload") or {}
+            pt = p.get("type")
+            ts = (o.get("timestamp") or "")[:19]
+            if pt == "message":
+                role = p.get("role")
+                if role == "user":
+                    t = _codex_user_text(p.get("content"))
+                    if t:
+                        turns.append((USER_LABEL, t, ts))
+                elif role == "assistant" and not lean:
+                    t = "\n".join((b.get("text") or "").strip() for b in p.get("content") or []
+                                  if isinstance(b, dict) and b.get("type") == "output_text").strip()
+                    if t:
+                        turns.append(("Codex", t, ts))
+                # developer/system messages = injected instructions → dropped
+            elif pt == "reasoning" and keep_thinking and not lean:
+                th = " ".join(" ".join((s.get("text") or "") for s in p.get("summary") or []
+                                       if isinstance(s, dict)).split())
+                if th:
+                    if len(th) > thinking_chars:
+                        th = th[:thinking_chars] + " […]"
+                    turns.append(("Codex", f"> 💭 {th}", ts))
+            elif pt == "custom_tool_call":
+                stubs = _codex_tool_stubs(p.get("input"))
+                if p.get("name") not in (None, "exec"):
+                    stubs = [f"⏺ {p['name']}"]
+                if stubs:
+                    turns.append(("Codex", "\n".join(stubs), ts))
+            elif pt == "function_call":
+                args = " ".join(str(p.get("arguments", "")).split())
+                turns.append(("Codex", f"⏺ {p.get('name', '?')}: " + (args[:110] + "…" if len(args) > 110 else args), ts))
+            # *_output → dropped (bulky; the call stub carries intent)
+    # merge consecutive same-role pieces into one turn, as CC transcripts arrive
+    merged = []
+    for role, text, ts in turns:
+        if merged and merged[-1][0] == role and role != USER_LABEL:
+            merged[-1] = (role, merged[-1][1] + "\n" + text, merged[-1][2])
+        else:
+            merged.append((role, text, ts))
+    return merged
+
+
+def _codex_render_meta(path, kept):
+    m = _codex_meta(path)
+    first_ts = last_ts = ""
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                ts = (json.loads(line).get("timestamp") or "")[:16]
+            except Exception:
+                continue
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+    except Exception:
+        pass
+    git = m.get("git") if isinstance(m.get("git"), dict) else {}
+    return {"project": Path(m.get("cwd", "")).name or "?", "sid": m.get("id") or Path(path).stem[-36:],
+            "files": 1, "kept": kept, "first_ts": first_ts, "last_ts": last_ts,
+            "branch": git.get("branch", ""),
+            "source": "Codex" + (f" {_codex_subagent(m)}" if _codex_subagent(m) else "")}
+
+
 def _parse_bound(s, end_of_day=False):
     """Parse YYYY-MM-DD or an ISO datetime as LOCAL time and return a UTC string
     comparable to the JSONL timestamps (which are UTC). Mixing zones here would
@@ -487,7 +781,8 @@ HEADER = """\
 <!-- Distilled by ccdistill — tool OUTPUTS were stripped and may be STALE. -->
 You are resuming interrupted work in a NEW session. Below is a distilled brief of the
 prior session: human + assistant messages, the assistant's reasoning, and which tools
-were called and why. Tool OUTPUTS, injected CLAUDE.md, and system-reminders were removed.
+were called and why. Tool OUTPUTS, injected CLAUDE.md / AGENTS.md, and system-reminders
+were removed.
 
 BEFORE taking any action, establish ground truth from the repo — do NOT trust the
 brief's implied state:
@@ -506,34 +801,40 @@ is genuinely missing.
 """
 
 
-def render(turns, chain, project_dir, with_header=True, with_meta=True, slice_note=""):
+def _cc_render_meta(chain, project_dir, kept):
+    proj = project_dir.name.rsplit("-", 1)[-1] if project_dir else "?"
+    sid = Path(chain[0]).stem if chain else "?"
+    # date range + git branch from the transcript
+    first_ts = last_ts = branch = ""
+    try:
+        for line in open(chain[0], encoding="utf-8", errors="replace"):
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            ts = (o.get("timestamp") or "")[:16]
+            if ts and not first_ts:
+                first_ts = ts
+            if ts:
+                last_ts = ts
+            branch = branch or o.get("gitBranch") or ""
+    except Exception:
+        pass
+    return {"project": proj, "sid": sid, "files": len(chain), "kept": kept,
+            "first_ts": first_ts, "last_ts": last_ts, "branch": branch, "source": "Claude Code"}
+
+
+def render(turns, meta, with_header=True, with_meta=True, slice_note=""):
     body = "\n\n".join(f"### {role}\n{text}" for role, text, *_ in turns)
     out = []
     if with_header:
         out.append(HEADER)
     if with_meta:
-        proj = project_dir.name.rsplit("-", 1)[-1] if project_dir else "?"
-        sid = Path(chain[0]).stem if chain else "?"
-        # date range + git branch from the transcript
-        first_ts = last_ts = branch = ""
-        try:
-            for line in open(chain[0], encoding="utf-8", errors="replace"):
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                ts = (o.get("timestamp") or "")[:16]
-                if ts and not first_ts:
-                    first_ts = ts
-                if ts:
-                    last_ts = ts
-                branch = branch or o.get("gitBranch") or ""
-        except Exception:
-            pass
         out.append(
-            f"**Project:** {proj}  •  **Session:** {sid}  •  **Files in chain:** "
-            f"{len(chain)}  •  **Turns kept:** {len(turns)}\n"
-            f"**Span:** {first_ts} → {last_ts}  •  **Branch:** {branch or '?'}\n"
+            f"**Source:** {meta['source']}  •  **Project:** {meta['project']}  •  "
+            f"**Session:** {meta['sid']}  •  **Files in chain:** "
+            f"{meta['files']}  •  **Turns kept:** {meta['kept']}\n"
+            f"**Span:** {meta['first_ts']} → {meta['last_ts']}  •  **Branch:** {meta['branch'] or '?'}\n"
             + (f"\n> ⚠ **PARTIAL VIEW — {slice_note}.** This is a slice of the session, "
                f"not the whole thing; anything outside it is unread.\n" if slice_note else "")
         )
@@ -567,72 +868,100 @@ def main():
                          "(drops assistant prose/thinking) — the cheap arc view for huge sessions")
     a = ap.parse_args()
 
-    # --list: non-interactive discovery for agents/scripts (id → `ccdistill <id>`)
+    def rows_for_scope(limit, all_projects):
+        if CODEX_DEFAULT:
+            return _codex_scope_rows(a.project, all_projects, limit), None
+        return _scope_rows(a.project, all_projects, limit=limit)
+
     if a.list:
-        rows, _ = _scope_rows(a.project, a.all_projects, limit=a.limit)
+        rows, _ = rows_for_scope(a.limit, a.all_projects)
         if not rows:
-            print("ccdistill: no sessions found for this scope.", file=sys.stderr)
+            print(f"{PROG}: no sessions found for this scope.", file=sys.stderr)
             sys.exit(1)
         _emit_list(rows, a.json)
         return
 
-    chain, project_dir = [], None
+    chain, project_dir, codex_path = [], None, None
 
     if a.session:
-        chain, project_dir = _find_session(a.session)
-        if not chain:
-            print(f"ccdistill: no session found for '{a.session}'", file=sys.stderr)
+        # Own store first, then the other one: a path or id is read in whatever format it is.
+        p = Path(a.session)
+        if p.suffix == ".jsonl" and p.exists():
+            if _is_codex(p):
+                codex_path = p
+            else:
+                chain, project_dir = _find_session(a.session)
+        elif CODEX_DEFAULT:
+            codex_path = _codex_find(a.session)
+            if not codex_path:
+                chain, project_dir = _find_session(a.session)
+        else:
+            chain, project_dir = _find_session(a.session)
+            if not chain:
+                codex_path = _codex_find(a.session)
+        if not chain and not codex_path:
+            print(f"{PROG}: no session found for '{a.session}'", file=sys.stderr)
             sys.exit(1)
     else:
-        rows, project_dir = _scope_rows(a.project, a.all_projects and a.pick)
+        rows, project_dir = rows_for_scope(20, a.all_projects and a.pick)
         if not rows:
-            print("ccdistill: no CC sessions for this cwd; pass a session-id, --project NAME, or --list",
+            kind = "Codex" if CODEX_DEFAULT else "CC"
+            print(f"{PROG}: no {kind} sessions for this cwd; pass a session-id, --project NAME, or --list",
                   file=sys.stderr)
             sys.exit(1)
         if a.pick:
             if not sys.stdin.isatty():
-                print("ccdistill: --pick needs an interactive terminal. For agents/scripts run "
-                      "`ccdistill --list [--json]` to get ids, then `ccdistill <id>`.", file=sys.stderr)
+                print(f"{PROG}: --pick needs an interactive terminal. For agents/scripts run "
+                      f"`{PROG} --list [--json]` to get ids, then `{PROG} <id>`.", file=sys.stderr)
                 sys.exit(2)
             import datetime as _dt
             titles = _ccd_titles()
             for i, (f, m, d) in enumerate(rows, 1):
                 age = _dt.datetime.fromtimestamp(m).strftime("%b %d %H:%M")
-                label = titles.get(Path(f).stem) or _first_user_title(str(f))
-                print(f"  [{i:2}] {age}  {d.name.rsplit('-', 1)[-1]:<16} {label}",
-                      file=sys.stderr)
+                if isinstance(d, str):
+                    proj, label = d, _codex_titles().get(_codex_id(f)) or _codex_first_request(f)
+                else:
+                    proj, label = d.name.rsplit("-", 1)[-1], titles.get(Path(f).stem) or _first_user_title(str(f))
+                print(f"  [{i:2}] {age}  {proj:<16} {label}", file=sys.stderr)
             try:
                 f, _, d = rows[int(input("pick #: ").strip()) - 1]
             except (ValueError, IndexError, EOFError, KeyboardInterrupt):
-                print("ccdistill: cancelled.", file=sys.stderr)
+                print(f"{PROG}: cancelled.", file=sys.stderr)
                 sys.exit(1)
         else:
             f, _, d = rows[0]
-        sid = _session_id_of(str(f)) or f.stem
-        dirs = _dirs_containing_session(sid) or [d]
-        chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
+        if isinstance(d, str):
+            codex_path = f
+        else:
+            sid = _session_id_of(str(f)) or f.stem
+            dirs = _dirs_containing_session(sid) or [d]
+            chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
 
-    # schema-version sanity (warn only — parser is defensive)
-    ver = ""
-    try:
-        ver = json.loads(next(open(chain[0], encoding="utf-8", errors="replace"))).get("version", "")
-    except Exception:
-        pass
-    if ver and not ver.startswith(KNOWN_VERSION_PREFIX):
-        print(f"ccdistill: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
-              f"schema may have drifted, review output.", file=sys.stderr)
-
-    turns = distill(chain, keep_thinking=not a.no_thinking,
-                    thinking_chars=a.thinking_chars, level=a.level)
+    if codex_path:
+        chain = [str(codex_path)]
+        turns = distill_codex(codex_path, keep_thinking=not a.no_thinking,
+                              thinking_chars=a.thinking_chars, level=a.level)
+    else:
+        # schema-version sanity (warn only — parser is defensive)
+        ver = ""
+        try:
+            ver = json.loads(next(open(chain[0], encoding="utf-8", errors="replace"))).get("version", "")
+        except Exception:
+            pass
+        if ver and not ver.startswith(KNOWN_VERSION_PREFIX):
+            print(f"{PROG}: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
+                  f"schema may have drifted, review output.", file=sys.stderr)
+        turns = distill(chain, keep_thinking=not a.no_thinking,
+                        thinking_chars=a.thinking_chars, level=a.level)
     if not turns:
-        print("ccdistill: session had no distillable content.", file=sys.stderr)
+        print(f"{PROG}: session had no distillable content.", file=sys.stderr)
         sys.exit(1)
 
     total = len(turns)
     if a.since or a.until or a.last:
         turns = window(turns, since=a.since, until=a.until, last=a.last)
         if not turns:
-            print("ccdistill: the requested window contains no turns.", file=sys.stderr)
+            print(f"{PROG}: the requested window contains no turns.", file=sys.stderr)
             sys.exit(1)
 
     bits = []
@@ -642,25 +971,27 @@ def main():
     if a.level != "full": bits.append("level=user (assistant prose dropped, tool-call intents kept)")
     slice_note = ", ".join(bits) + f" — {len(turns)} of {total} turns" if bits else ""
 
-    text = render(turns, chain, project_dir,
+    meta = (_codex_render_meta(codex_path, len(turns)) if codex_path
+            else _cc_render_meta(chain, project_dir, len(turns)))
+    text = render(turns, meta,
                   with_header=not (a.no_header or a.raw),
                   with_meta=not a.raw,
                   slice_note=slice_note)
 
     if _SECRET_RE.search(text):
-        print("ccdistill: ⚠ possible secret in output (a tool input may contain a key) — review before sharing.",
+        print(f"{PROG}: ⚠ possible secret in output (a tool input may contain a key) — review before sharing.",
               file=sys.stderr)
 
     raw_bytes = sum(os.path.getsize(f) for f in chain if os.path.exists(f))
     out_bytes = len(text.encode("utf-8"))
     ratio = raw_bytes / out_bytes if out_bytes else 0
-    print(f"ccdistill: {len(chain)} file(s), {len(turns)} turns  •  "
+    print(f"{PROG}: {len(chain)} file(s), {len(turns)} turns  •  "
           f"{raw_bytes//1024} KB → {out_bytes//1024} KB (~{ratio:.1f}× smaller, "
           f"~{_est_tokens(text):,} tokens)", file=sys.stderr)
 
     if a.out:
         Path(a.out).write_text(text, encoding="utf-8")
-        print(f"ccdistill: wrote {a.out}", file=sys.stderr)
+        print(f"{PROG}: wrote {a.out}", file=sys.stderr)
     else:
         sys.stdout.write(text)
 
