@@ -55,6 +55,23 @@ def test_annotation_is_quoted_with_the_request():
     assert ann and "Should never happen" in ann[0]
 
 
+def test_annotation_comment_is_kept_whole_even_with_an_empty_request():
+    # Real message: the request field was empty and the whole message was the
+    # comment under the "annotation" key, so a reader that missed the key lost the turn.
+    users = [t for r, t, _ in cd.distill_codex(FIXTURE) if r == cd.USER_LABEL]
+    turn = [u for u in users if "Ctrl+Alt+N" in u]
+    assert turn, users
+    assert "How does this work when VLC is focused?" in turn[0]
+
+
+def test_wrapped_or_broken_annotation_block_is_kept_not_dropped():
+    wrapped = '<response-annotations>\nuser: [{"text":"a passage","annotation":"my comment","source":{}}]\nuser:\n</response-annotations>'
+    assert cd._codex_annotations(wrapped) == ["[on «a passage»]\nmy comment"]
+    broken = "<response-annotations>[{not json</response-annotations>"
+    out = cd._codex_annotations(broken)
+    assert out and "not json" in out[0]
+
+
 def test_tool_calls_become_shell_stubs_and_outputs_are_dropped():
     body = text_of(cd.distill_codex(FIXTURE))
     assert "⏺ exec: pwd; rg --files" in body

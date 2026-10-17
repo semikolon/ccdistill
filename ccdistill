@@ -361,7 +361,7 @@ def _emit_list(rows, as_json):
     for f, m, d in rows:
         if isinstance(d, str):        # a Codex row carries its project name, not a dir
             sid = _codex_id(f)
-            project, title = d, _codex_titles().get(sid) or _codex_first_request(f)
+            project, title = d, _codex_title(f)
         else:
             sid = Path(f).stem
             project, title = d.name.rsplit("-", 1)[-1], titles.get(sid) or _first_user_title(str(f))
@@ -578,15 +578,34 @@ def _codex_find(arg: str):
 
 
 def _codex_subagent(meta: dict) -> str:
-    """'subagent <nickname> (<task path>) of <parent id>' for a Codex subagent, else ''.
-    A subagent's task arrives through its parent's spawn call, so its own file has no
-    user turn; the parent's transcript holds the request."""
-    if meta.get("thread_source") != "subagent":
+    """A label for a thread Codex started itself, else '' for one a human started.
+    Two kinds seen: `subagent` (spawned for a task; the task arrives through the
+    parent's spawn call, so its own file has no request) and `guardian_review`
+    (Codex's automatic reviewer of a risky action, whose one "user" message is the
+    whole parent history pasted in for review, not something a human typed). Both
+    get 'subagent <nickname> (<task>) of <parent>' or 'guardian review of <parent>'."""
+    kind = meta.get("thread_source") or "user"
+    if kind == "user":
         return ""
-    name = meta.get("agent_nickname") or "?"
-    task = (meta.get("agent_path") or "").rsplit("/", 1)[-1]
     parent = meta.get("parent_thread_id") or meta.get("session_id") or "?"
-    return f"subagent {name}" + (f" ({task})" if task else "") + f" of {parent}"
+    if kind == "subagent":
+        name = meta.get("agent_nickname") or "?"
+        task = (meta.get("agent_path") or "").rsplit("/", 1)[-1]
+        return f"subagent {name}" + (f" ({task})" if task else "") + f" of {parent}"
+    return f"{kind.replace('_', ' ')} of {parent}"
+
+
+def _codex_title(path) -> str:
+    """Thread name for a human-started thread; for one Codex started itself, what it
+    is and whose it is ('guardian review of <parent> «<parent's name>»'), since its
+    own index name is the same for every reviewer."""
+    meta = _codex_meta(path)
+    sub = _codex_subagent(meta)
+    if sub:
+        parent = meta.get("parent_thread_id") or meta.get("session_id") or ""
+        pname = _codex_titles().get(parent, "")
+        return "[" + sub + (f" «{pname}»" if pname else "") + "]"
+    return _codex_titles().get(meta.get("id") or "") or _codex_first_request(path)
 
 
 def _codex_first_request(path) -> str:
@@ -627,18 +646,39 @@ def _codex_user_text(content) -> str:
             names = re.findall(r"^## (.+?): /", head, re.M)
             if names:
                 pre.append("[attached: " + ", ".join(names) + "]")
-            ann = re.search(r"<response-annotations>\s*(.*?)\s*</response-annotations>", head, re.S)
-            if ann:
-                try:
-                    for item in json.loads(ann.group(1)):
-                        quote = " ".join(str(item.get("text", "")).split())[:200]
-                        note = item.get("comment") or ""
-                        pre.append(f"[on «{quote}»" + (f": {note}" if note else "") + "]")
-                except Exception:
-                    pass
+            pre += _codex_annotations(head)
             s = "\n".join(pre + [req.strip()])
         out.append(s)
     return "\n".join(out).strip()
+
+
+def _codex_annotations(head: str):
+    """The passages the human marked in an earlier answer, each with their comment.
+    The comment is their own words and is kept whole; the marked passage is the
+    agent's text and is shortened. Seen in two shapes: a bare JSON list, and the
+    list wrapped as `user: [ ... ]`. A block that still fails to parse is kept raw
+    rather than dropped, since dropping it loses what the human wrote."""
+    m = re.search(r"<response-annotations>\s*(.*?)\s*</response-annotations>", head, re.S)
+    if not m:
+        return []
+    raw = m.group(1)
+    start, end = raw.find("["), raw.rfind("]")
+    try:
+        items = json.loads(raw[start:end + 1]) if 0 <= start < end else None
+    except Exception:
+        items = None
+    if not isinstance(items, list):
+        return ["[annotations, unparsed: " + " ".join(raw.split()) + "]"]
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        quote = " ".join(str(item.get("text", "")).split())
+        if len(quote) > 300:
+            quote = quote[:300] + "…"
+        note = (item.get("annotation") or item.get("comment") or "").strip()
+        lines.append(f"[on «{quote}»" + (f"]\n{note}" if note else "]"))
+    return lines
 
 
 def _codex_commands(script: str):
@@ -919,7 +959,7 @@ def main():
             for i, (f, m, d) in enumerate(rows, 1):
                 age = _dt.datetime.fromtimestamp(m).strftime("%b %d %H:%M")
                 if isinstance(d, str):
-                    proj, label = d, _codex_titles().get(_codex_id(f)) or _codex_first_request(f)
+                    proj, label = d, _codex_title(f)
                 else:
                     proj, label = d.name.rsplit("-", 1)[-1], titles.get(Path(f).stem) or _first_user_title(str(f))
                 print(f"  [{i:2}] {age}  {proj:<16} {label}", file=sys.stderr)
