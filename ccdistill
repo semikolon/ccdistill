@@ -58,6 +58,14 @@ Codex sessions (OpenAI Codex CLI / desktop):
   `⏺ exec: <shell command>`; file edits happen inside those commands. Codex keeps
   its reasoning encrypted, so only its short reasoning summaries survive.
 
+Antigravity (Gemini) conversations:
+  `ccdistill <conversation-id>` (also as `agdistill` / `antigravity-export`, symlinks) reads
+  ~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript_full.jsonl. A message with
+  an @[Quote] annotation is followed by the passage it quoted, recovered from the conversation
+  database (conversations/<id>.db), since both logs drop it. Under `agdistill` an id prefix
+  resolves to Antigravity first; under the other names a full id does, a prefix only when the
+  Claude and Codex stores have no match.
+
 Notes:
   - Handles the compaction chain (multiple files sharing one sessionId).
   - A project can live in SEVERAL dirs at once (live root + archive roots): all
@@ -85,6 +93,7 @@ _EXTRA_ROOTS = [p for p in os.environ.get("CCDISTILL_ARCHIVE_ROOTS", "").split(o
 USER_LABEL = os.environ.get("CCDISTILL_USER_LABEL", "User")   # label for the human's turns
 KNOWN_VERSION_PREFIX = "2."          # warn (don't fail) outside this major line
 PROG = Path(sys.argv[0]).name or "ccdistill"
+AG_DEFAULT = PROG.startswith(("agdistill", "antigravity"))   # installed as `agdistill` → Antigravity ids first
 CODEX_DEFAULT = PROG.startswith("codex")   # installed as `codexdistill` → Codex is the default store
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_ROOTS = [CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions"]
@@ -801,6 +810,123 @@ def _parse_bound(s, end_of_day=False):
     return d.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+# ── Antigravity (Gemini) conversations ───────────────────────────────────────────
+# Added 2026-11-15. Antigravity keeps each conversation in ~/.gemini/antigravity:
+# brain/<id>/.system_generated/logs/transcript_full.jsonl holds every message (the shorter
+# transcript.jsonl truncates long replies), and conversations/<id>.db holds, in each step's
+# protobuf payload, the passage an @[Quote] annotation pointed at, which both logs drop.
+AG_HOME = Path(os.environ.get("ANTIGRAVITY_HOME", HOME / ".gemini" / "antigravity"))
+
+
+def _ag_find(arg: str):
+    """An Antigravity conversation id for an id or unique prefix; None when nothing matches."""
+    brain = AG_HOME / "brain"
+    if not brain.is_dir() or not re.fullmatch(r"[0-9a-fA-F-]{4,}", arg):
+        return None
+    hits = [d.name for d in brain.iterdir() if d.is_dir() and d.name.startswith(arg)]
+    if len(hits) > 1:
+        print(f"{PROG}: '{arg}' matches {len(hits)} Antigravity conversations: " + ", ".join(hits[:8]),
+              file=sys.stderr)
+        raise SystemExit(2)
+    return hits[0] if hits else None
+
+
+def _ag_log(cid: str) -> Path:
+    logs = AG_HOME / "brain" / cid / ".system_generated" / "logs"
+    full = logs / "transcript_full.jsonl"
+    return full if full.exists() else logs / "transcript.jsonl"
+
+
+def _ag_quotes(cid: str) -> dict:
+    """step index -> readable text runs from that step's stored payload (copied db: the live one is locked)."""
+    import shutil, sqlite3, tempfile
+    src = AG_HOME / "conversations" / f"{cid}.db"
+    out = {}
+    if not src.exists():
+        return out
+    tmp = tempfile.mkdtemp()
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            if Path(str(src) + suffix).exists():
+                shutil.copy(str(src) + suffix, os.path.join(tmp, "c.db" + suffix))
+        db = sqlite3.connect(os.path.join(tmp, "c.db"))
+        for idx, payload in db.execute("select idx, step_payload from steps"):
+            if payload:
+                out[idx] = [r.strip() for r in re.findall(r"[^\x00-\x1f�]{20,}",
+                                                          payload.decode("utf-8", "replace"))]
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+def _ag_quoted(text: str, runs: list) -> list:
+    said = set(text.splitlines())
+    return [s for s in runs if s not in said and s.lstrip("YQZ ") not in text
+            and not re.fullmatch(r"[\w$\"\- ]{0,60}", s)
+            and not s.endswith(("_check", "*")) and not s.startswith(("#", "/"))]
+
+
+def distill_antigravity(cid: str, keep_thinking=True, thinking_chars=700, level="full"):
+    """Antigravity conversation → the same (role, text, ts) turn list `distill` returns,
+    each annotated message followed by the passages it quoted."""
+    turns, lean = [], level == "user"
+    quotes = _ag_quotes(cid)
+    try:
+        fh = open(_ag_log(cid), encoding="utf-8", errors="replace")
+    except Exception:
+        return turns
+    with fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            t, ts, step = r.get("type"), (r.get("created_at") or "")[:19], r.get("step_index")
+            if t == "USER_INPUT":
+                c = r.get("content", "")
+                m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", c, re.S)
+                text = (m.group(1) if m else c).strip()
+                if "@[" in text:
+                    q = _ag_quoted(text, quotes.get(step, []))
+                    if q:
+                        text += "\n> **Quoted:** " + "\n> ".join(q)
+                if text:
+                    turns.append((USER_LABEL, text, ts))
+            elif t == "PLANNER_RESPONSE":
+                th = (r.get("thinking") or "").strip()
+                if th and keep_thinking and not lean:
+                    th = th if len(th) <= thinking_chars else th[:thinking_chars] + "…"
+                    turns.append(("Gemini", "> 💭 " + " ".join(th.split()), ts))
+                calls = r.get("tool_calls") or []
+                if calls:
+                    names = [str(c.get("name") or c.get("function", {}).get("name") or "?") if isinstance(c, dict)
+                             else "?" for c in calls]
+                    turns.append(("Gemini", "⏺ " + ", ".join(names), ts))
+                content = (r.get("content") or "").strip()
+                if content and not lean:
+                    turns.append(("Gemini", content, ts))
+    return turns
+
+
+def _ag_render_meta(cid: str, kept: int):
+    first_ts = last_ts = ""
+    try:
+        for line in open(_ag_log(cid), encoding="utf-8", errors="replace"):
+            try:
+                ts = (json.loads(line).get("created_at") or "")[:16]
+            except Exception:
+                continue
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+    except Exception:
+        pass
+    return {"project": "Antigravity", "sid": cid, "files": 1, "kept": kept,
+            "first_ts": first_ts, "last_ts": last_ts, "branch": "", "source": "Antigravity (Gemini)"}
+
+
 def window(turns, since=None, until=None, last=None):
     """Slice a distilled session: --since/--until by wall-clock, --last by turn count."""
     lo = _parse_bound(since) if since else None
@@ -921,9 +1047,13 @@ def main():
         _emit_list(rows, a.json)
         return
 
-    chain, project_dir, codex_path = [], None, None
+    chain, project_dir, codex_path, ag_id = [], None, None, None
 
-    if a.session:
+    # An Antigravity id is taken first when it names a conversation in full (or the program is
+    # invoked as agdistill); a prefix only after the Claude and Codex stores found nothing.
+    if a.session and (AG_DEFAULT or (AG_HOME / "brain" / a.session).is_dir()) and _ag_find(a.session):
+        ag_id = _ag_find(a.session)
+    elif a.session:
         # Own store first, then the other one: a path or id is read in whatever format it is.
         p = Path(a.session)
         if p.suffix == ".jsonl" and p.exists():
@@ -940,6 +1070,8 @@ def main():
             if not chain:
                 codex_path = _codex_find(a.session)
         if not chain and not codex_path:
+            ag_id = _ag_find(a.session)
+        if not chain and not codex_path and not ag_id:
             print(f"{PROG}: no session found for '{a.session}'", file=sys.stderr)
             sys.exit(1)
     else:
@@ -977,7 +1109,11 @@ def main():
             dirs = _dirs_containing_session(sid) or [d]
             chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
 
-    if codex_path:
+    if ag_id:
+        chain = [str(_ag_log(ag_id))]
+        turns = distill_antigravity(ag_id, keep_thinking=not a.no_thinking,
+                                    thinking_chars=a.thinking_chars, level=a.level)
+    elif codex_path:
         chain = [str(codex_path)]
         turns = distill_codex(codex_path, keep_thinking=not a.no_thinking,
                               thinking_chars=a.thinking_chars, level=a.level)
@@ -1011,7 +1147,8 @@ def main():
     if a.level != "full": bits.append("level=user (assistant prose dropped, tool-call intents kept)")
     slice_note = ", ".join(bits) + f" — {len(turns)} of {total} turns" if bits else ""
 
-    meta = (_codex_render_meta(codex_path, len(turns)) if codex_path
+    meta = (_ag_render_meta(ag_id, len(turns)) if ag_id
+            else _codex_render_meta(codex_path, len(turns)) if codex_path
             else _cc_render_meta(chain, project_dir, len(turns)))
     text = render(turns, meta,
                   with_header=not (a.no_header or a.raw),
