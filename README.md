@@ -81,6 +81,22 @@ ccdistill --list --json       # [{id, modified, project, size_kb, title, ...}]
 Pick an `id` (the `size_kb` field hints how substantial a session is — skip a tiny
 just-started one, e.g. the agent's own current session), then `ccdistill <id>`.
 
+### What did I do in my other sessions? (`--digest`)
+
+A session that has sat idle for hours can ask, before it asks you what happened meanwhile:
+
+```bash
+ccdistill --digest --hours 20 --exclude <this session's id>
+```
+
+It prints, for the sessions touched since then (all projects, newest first, the asking session
+left out): the project, the title, when it was last active, and **your** last messages in it, each
+cut to one line. The output has a hard cap (6,000 characters, about 1,500 tokens; `--cap`,
+`--messages`, `--chars` and `--sessions` change it), and a session cut off by the cap is counted
+rather than shown. Each session is read from its end and only as far back as the moment, so the
+cost follows the answer, not the size of the transcripts. Scheduled pings, pasted skill bodies and
+image placeholders are not counted as you speaking.
+
 ## Codex sessions
 
 The same program reads [OpenAI Codex](https://developers.openai.com/codex) transcripts
@@ -131,6 +147,12 @@ stale-transcript-path-on-continued-sessions behavior.
 --until WHEN       keep turns at/before WHEN (a bare date means end of that day)
 --last N           keep only the last N turns (applied after --since/--until)
 --level user       human turns + assistant tool-call intents only (drops assistant prose)
+--full-pass        with --since/--last: read the whole transcript instead of its end (slower;
+                   the banner then counts the session's turns)
+--digest           the human's other sessions since a moment, capped (see above)
+--hours H          with --digest: the moment as H hours ago (default 24; --since gives a date/time)
+--exclude ID       with --digest: leave a session out, usually the asking one (repeatable)
+--messages N, --chars N, --sessions N, --cap N     with --digest: size of the answer
 ```
 
 ### Reading a very long session
@@ -147,8 +169,24 @@ options slice it. Measured on a real 6 607-turn, 30-day session:
 | `ccdistill <id> --since 2026-08-04 --level user` | ~98k |
 | `ccdistill <id> --last 40` | ~4k — where it left off |
 
-Any slice prints a **PARTIAL VIEW** banner naming the window and the kept/total turn
-count, so a partial read is never mistaken for the whole session. `--since`/`--until` are
+Any slice prints a **PARTIAL VIEW** banner naming the window and the number of turns kept, so a
+partial read is never mistaken for the whole session. `--since` and `--last` are read from the
+**end** of the transcript, so the cost follows the slice and not the session, and the banner then
+says that the session's total was not counted (`--full-pass` reads everything and counts it).
+Measured on real sessions (2026-11-16, Python 3.14, Apple M2):
+
+| invocation | before | now |
+|---|---|---|
+| `--last 40 --level user`, 91 MB session | 795 ms | 69 ms |
+| `--last 40 --level user`, 145 MB session | 1,131 ms | 60 ms |
+| whole 91 MB session, `--level user` | 740 ms | 278 ms |
+| `--digest --hours 20`, 7 sessions, 3 GB of transcripts | 1,473 ms (six runs, one per session) | 144 ms |
+
+The saving comes from three things: a raw-byte test that skips the lines that cannot hold a turn
+(attachments, API-request blobs, snapshots: two thirds of the bytes of a real transcript) before
+any JSON is parsed; a memory-mapped search backwards from the end of the file that copies out only
+the lines it needs; and no second pass over the whole file for the header's date range. About 35 ms
+of what is left is Python starting up and compiling the script. `--since`/`--until` are
 parsed in *your* local time and converted to UTC before comparing against the transcript's
 UTC timestamps — a raw comparison would quietly shift every boundary by your offset.
 

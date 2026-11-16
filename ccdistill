@@ -43,6 +43,14 @@ Flags:
   --thinking-chars N truncate each thinking block to N chars (default 700)
   --no-header        omit the repo-verify resume-prompt header
   --raw              transcript only, no header + no metadata (for further piping)
+  --since/--until/--last/--level   slice a long session (see the README); --since and --last
+                     are read from the END of the transcript, so the cost follows the slice
+  --full-pass        with --since/--last: read the whole transcript instead (slower; counts turns)
+  --digest           the human's OTHER sessions since a moment: each session's title and the
+                     human's last messages in it, under a hard cap (about 1,500 tokens):
+                       ccdistill --digest --hours 20 --exclude <this session's id>
+                     options: --hours H | --since WHEN, --messages N, --chars N, --sessions N,
+                     --cap N, --exclude ID (repeatable), --project NAME
 
 Env:
   CCDISTILL_USER_LABEL     label for the human's turns (default: User)
@@ -82,7 +90,8 @@ Notes:
 """
 
 from __future__ import annotations   # `X | Y` annotations on Python 3.8/3.9 (e.g. Big Sur)
-import sys, os, re, json, glob, argparse
+import sys, os, re, json, glob, argparse, mmap
+from collections import deque
 from pathlib import Path
 
 HOME = Path.home()
@@ -178,6 +187,27 @@ def _session_id_of(jsonl: str, max_lines=50):
     return None
 
 
+_HEAD_BYTES = 65536
+
+
+_SESSION_ID_RE = re.compile(rb'"sessionId":"([0-9A-Fa-f-]{36})"')
+
+
+def _may_hold_session(jsonl: str, sid: str) -> bool:
+    """False only when the file certainly belongs to ANOTHER session: its first 64 KB name a
+    different session id and never `sid`. A head that names no id at all (snapshot lines
+    first, one very long first line) says nothing, so that stays True. This spares parsing
+    up to 50 lines of every transcript in a project folder to find one chain."""
+    try:
+        with open(jsonl, "rb") as fh:
+            head = fh.read(_HEAD_BYTES)
+    except OSError:
+        return False
+    if sid.encode("utf-8") in head:
+        return True
+    return _SESSION_ID_RE.search(head) is None
+
+
 def _chain_for_session(sid: str, project_dirs):
     """All transcript files for a sessionId (compaction chain) across the given
     project dirs, oldest-first. Deduped by file stem — if the same transcript
@@ -188,6 +218,8 @@ def _chain_for_session(sid: str, project_dirs):
     for pd in project_dirs:
         for f in pd.glob("*.jsonl"):
             if "subagent" in f.name or f.name.startswith("agent-"):
+                continue
+            if f.stem != sid and not _may_hold_session(str(f), sid):
                 continue
             if _session_id_of(str(f)) == sid:
                 mt = f.stat().st_mtime
@@ -225,6 +257,31 @@ def _ccd_titles():
     return titles
 
 
+def _ccd_titles_for(ids):
+    """The titles of just these sessions. Reads every metadata file as bytes and parses only
+    those that name one of the ids: parsing all ~200 of them took 100 ms of a 200 ms digest
+    that shows six titles. Same value as `_ccd_titles()` for the ids it is given."""
+    wanted = [i.encode("utf-8") for i in ids]
+    titles = {}
+    if not wanted:
+        return titles
+    try:
+        for f in _CCD_SESSIONS_ROOT.glob("*/*/*.json"):
+            try:
+                raw = f.read_bytes()
+                if not any(w in raw for w in wanted):
+                    continue
+                o = json.loads(raw.decode("utf-8", errors="replace"))
+                sid, title = o.get("cliSessionId"), o.get("title")
+                if sid in ids and title:
+                    titles[sid] = " ".join(str(title).split())
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return titles
+
+
 def _dirs_containing_session(sid: str):
     """All project dirs (across all roots) holding transcript files for sid."""
     dirs = []
@@ -245,13 +302,21 @@ def _find_session(arg: str):
     if p.suffix == ".jsonl" and p.exists():
         sid = _session_id_of(str(p)) or p.stem
         return _chain_for_session(sid, p.parent), p.parent
-    # 1) exact match on filename stem or in-file sessionId
+    # 1) exact match on filename stem (Claude Code names a file by its session UUID: a direct
+    #    look, no file opened), then on the in-file sessionId
+    for root in _roots():
+        for d in Path(root).iterdir():
+            if d.is_dir() and (d / f"{arg}.jsonl").is_file():
+                f = d / f"{arg}.jsonl"
+                sid = _session_id_of(str(f)) or f.stem
+                dirs = _dirs_containing_session(sid) or [d]
+                return _chain_for_session(sid, dirs), dirs[0]
     for root in _roots():
         for d in Path(root).iterdir():
             if not d.is_dir():
                 continue
             for f in d.glob("*.jsonl"):
-                if f.stem == arg or _session_id_of(str(f)) == arg:
+                if f.stem == arg or (_may_hold_session(str(f), arg) and _session_id_of(str(f)) == arg):
                     sid = _session_id_of(str(f)) or f.stem
                     dirs = _dirs_containing_session(sid) or [d]
                     return _chain_for_session(sid, dirs), dirs[0]
@@ -365,7 +430,7 @@ def _emit_list(rows, as_json):
     title); JSON with --json. `size_kb` is a free proxy for how substantial a session
     is — an agent can skip a tiny just-started session (e.g. its own)."""
     import datetime as _dt
-    titles = _ccd_titles()
+    titles = _ccd_titles_for({Path(f).stem for f, _, d in rows if not isinstance(d, str)})
     items = []
     for f, m, d in rows:
         if isinstance(d, str):        # a Codex row carries its project name, not a dir
@@ -421,60 +486,233 @@ def _tool_stub(name: str, inp: dict) -> str | None:
 
 
 # ---- distillation ------------------------------------------------------------
-def distill(chain, keep_thinking=True, thinking_chars=700, level="full"):
-    """level='full' keeps everything; level='user' keeps the human's turns plus the
-    assistant's tool-call intents only (drops assistant prose + thinking) — the
+def _turn_of(o, keep_thinking=True, thinking_chars=700, level="full"):
+    """One parsed transcript line -> (role, text, timestamp) or None when it holds no
+    kept turn. level='full' keeps everything; level='user' keeps the human's turns plus
+    the assistant's tool-call intents only (drops assistant prose + thinking) — the
     cheap arc-only view for very long sessions."""
+    if o.get("type") not in ("user", "assistant"):
+        return None                   # drops attachment/system/snapshot/... = CLAUDE.md+reminders
+    if o.get("isSidechain") or o.get("isCompactSummary"):
+        return None
+    msg = o.get("message") or {}
+    cont = msg.get("content")
+    role = USER_LABEL if o.get("type") == "user" else "Claude"
+    pieces = []
+    if isinstance(cont, str):
+        t = cont.strip()
+        if t and not any(m in t for m in _NOISE):
+            pieces.append(t)
+    elif isinstance(cont, list):
+        for b in cont:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            lean = level == "user" and role != USER_LABEL
+            if bt == "text":
+                if lean:
+                    continue
+                t = (b.get("text") or "").strip()
+                if t and not any(m in t for m in _NOISE):
+                    pieces.append(t)
+            elif bt == "thinking" and keep_thinking and not lean:
+                th = " ".join((b.get("thinking") or "").split())
+                if th:
+                    if len(th) > thinking_chars:
+                        th = th[:thinking_chars] + " […]"
+                    pieces.append(f"> 💭 {th}")
+            elif bt == "tool_use":
+                stub = _tool_stub(b.get("name", "?"), b.get("input"))
+                if stub:
+                    pieces.append(stub)
+            # tool_result → dropped (bulky output; the tool_use stub carries intent)
+    if pieces:
+        return (role, "\n".join(pieces), (o.get("timestamp") or "")[:19])
+    return None
+
+
+# Raw-byte test for "this line can hold a user or assistant turn", made before any JSON
+# parse. Measured on four real sessions (350 MB, 2026-11-16): no line of those types missed,
+# no other line passed, and the lines it spares are two thirds of the bytes (attachments,
+# API request blobs, snapshots, titles). It holds for compact JSON, which Claude Code writes;
+# a file written with a space after the colon is read without it (_compact_json).
+_USER_MARK, _ASSISTANT_MARK = b'"type":"user"', b'"type":"assistant"'
+
+
+def _candidate(raw: bytes) -> bool:
+    return _USER_MARK in raw or _ASSISTANT_MARK in raw
+
+
+def _compact_json(jsonl: str) -> bool:
+    """Does this transcript write `"type":"user"` without a space? Looked up in its first
+    64 KB; a head that shows neither form is treated as not compact, so the byte test is
+    never used on a file it cannot be trusted for."""
+    try:
+        with open(jsonl, "rb") as fh:
+            head = fh.read(_HEAD_BYTES)
+    except OSError:
+        return False
+    return b'"type":"' in head and b'"type": "' not in head
+
+
+def _json_line(raw: bytes):
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _lines_forward(jsonl: str):
+    """Parsed lines of a transcript, oldest first; lines that cannot hold a turn are not
+    parsed when the file is compact JSON."""
+    try:
+        fh = open(jsonl, "rb")
+    except Exception:
+        return
+    prefilter = _compact_json(jsonl)
+    with fh:
+        for raw in fh:
+            if prefilter and not _candidate(raw):
+                continue
+            o = _json_line(raw)
+            if o is not None:
+                yield o
+
+
+def _lines_reversed(jsonl: str, block: int = 262144):
+    """The lines of a file, last first, read from the end in blocks of `block` bytes, so
+    that reading the end of a 150 MB transcript costs the end and not the file. Splits on
+    the byte 0x0A, which never occurs inside a multi-byte UTF-8 character, and joins a
+    line that spans blocks before it is handed out. Empty lines are not yielded."""
+    with open(jsonl, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        carry = deque()           # the start of the line that begins in an earlier block, in order
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            fh.seek(pos)
+            parts = fh.read(step).split(b"\n")
+            if len(parts) == 1:   # no line break in this block: the middle of one long line
+                carry.appendleft(parts[0])
+                continue
+            line = parts[-1] + b"".join(carry)
+            if line:
+                yield line
+            for p in parts[-2:0:-1]:
+                if p:
+                    yield p
+            carry = deque([parts[0]])
+        line = b"".join(carry)
+        if line:
+            yield line
+
+
+def _marked_lines_reversed(jsonl: str, markers):
+    """The lines of a file that contain any of `markers`, last first, found by searching
+    the memory-mapped file backwards for the markers and copying out only those lines. The
+    search runs in C at memory speed and a line without a marker is never copied, so for a
+    transcript where most bytes are attachments and tool output the cost is the scan, not
+    a read, a split and a test of every line. Same lines and order as
+    `[l for l in _lines_reversed(jsonl) if any(m in l for m in markers)]`."""
+    try:
+        with open(jsonl, "rb") as fh:
+            try:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except (ValueError, OSError):            # an empty file, or a file that cannot be mapped
+                for line in _lines_reversed(jsonl):
+                    if any(m in line for m in markers):
+                        yield line
+                return
+            with mm:
+                end = len(mm)
+                while end > 0:
+                    hit = max(mm.rfind(m, 0, end) for m in markers)
+                    if hit < 0:
+                        return
+                    start = mm.rfind(b"\n", 0, hit) + 1
+                    stop = mm.find(b"\n", hit, end)
+                    yield bytes(mm[start:stop if stop >= 0 else end])
+                    end = start
+    except OSError:
+        return
+
+
+def _lines_backward(jsonl: str):
+    """Like _lines_forward, newest first."""
+    if _compact_json(jsonl):
+        lines = _marked_lines_reversed(jsonl, (_USER_MARK, _ASSISTANT_MARK))
+    else:
+        lines = _lines_reversed(jsonl)
+    for raw in lines:
+        o = _json_line(raw)
+        if o is not None:
+            yield o
+
+
+def distill(chain, keep_thinking=True, thinking_chars=700, level="full"):
+    """Every kept turn of a transcript chain, oldest first (see _turn_of for `level`)."""
     turns = []
     for jsonl in chain:
-        try:
-            fh = open(jsonl, encoding="utf-8", errors="replace")
-        except Exception:
-            continue
-        with fh:
-            for line in fh:
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") not in ("user", "assistant"):
-                    continue          # drops attachment/system/snapshot/... = CLAUDE.md+reminders
-                if o.get("isSidechain") or o.get("isCompactSummary"):
-                    continue
-                msg = o.get("message") or {}
-                cont = msg.get("content")
-                role = USER_LABEL if o.get("type") == "user" else "Claude"
-                pieces = []
-                if isinstance(cont, str):
-                    t = cont.strip()
-                    if t and not any(m in t for m in _NOISE):
-                        pieces.append(t)
-                elif isinstance(cont, list):
-                    for b in cont:
-                        if not isinstance(b, dict):
-                            continue
-                        bt = b.get("type")
-                        lean = level == "user" and role != USER_LABEL
-                        if bt == "text":
-                            if lean:
-                                continue
-                            t = (b.get("text") or "").strip()
-                            if t and not any(m in t for m in _NOISE):
-                                pieces.append(t)
-                        elif bt == "thinking" and keep_thinking and not lean:
-                            th = " ".join((b.get("thinking") or "").split())
-                            if th:
-                                if len(th) > thinking_chars:
-                                    th = th[:thinking_chars] + " […]"
-                                pieces.append(f"> 💭 {th}")
-                        elif bt == "tool_use":
-                            stub = _tool_stub(b.get("name", "?"), b.get("input"))
-                            if stub:
-                                pieces.append(stub)
-                        # tool_result → dropped (bulky output; the tool_use stub carries intent)
-                if pieces:
-                    turns.append((role, "\n".join(pieces), (o.get("timestamp") or "")[:19]))
+        for o in _lines_forward(jsonl):
+            t = _turn_of(o, keep_thinking, thinking_chars, level)
+            if t:
+                turns.append(t)
     return turns
+
+
+# How many consecutive turns older than --since the backward reader looks at before it
+# believes the rest is older too (timestamps of one transcript are not strictly ordered).
+_OLDER_RUN = 200
+
+
+def _last_timestamp(jsonl: str) -> str:
+    """The timestamp of the last line of a transcript that has one ('' if none)."""
+    try:
+        for raw in _lines_reversed(jsonl):
+            o = _json_line(raw)
+            if isinstance(o, dict) and o.get("timestamp"):
+                return o["timestamp"][:19]
+    except OSError:
+        pass
+    return ""
+
+
+def distill_tail(chain, lo=None, hi=None, last=None, keep_thinking=True, thinking_chars=700, level="full"):
+    """The turns inside a window, read from the END of the chain instead of through all of
+    it: what `distill` followed by `window` returns, at the cost of the window. `lo`/`hi` are
+    UTC timestamp strings (see _parse_bound), `last` a turn count. A turn with no timestamp
+    is inside every window, as in `window`. Files are taken newest first (the order of the
+    chain, which is by modification time and not always the order of the content: one real
+    chain held turns of a window in a middle file); a file whose last timestamp is older than
+    `lo` is skipped, and within a file the reading stops after _OLDER_RUN turns in a row
+    older than `lo`."""
+    got = []                          # newest first
+    for jsonl in reversed(chain):
+        if lo:
+            end = _last_timestamp(jsonl)
+            if end and end < lo:
+                continue
+        older = 0
+        for o in _lines_backward(jsonl):
+            t = _turn_of(o, keep_thinking, thinking_chars, level)
+            if not t:
+                continue
+            ts = t[2]
+            if lo and ts and ts < lo:
+                older += 1
+                if older >= _OLDER_RUN:
+                    break
+                continue
+            older = 0
+            if hi and ts and ts > hi:
+                continue
+            got.append(t)
+            if last and len(got) >= last:
+                got.reverse()
+                return got
+    got.reverse()
+    return got
 
 
 # ---- Codex ------------------------------------------------------------------
@@ -967,25 +1205,42 @@ is genuinely missing.
 """
 
 
+def _span_and_branch(chain):
+    """(first timestamp, last timestamp, git branch) of a transcript chain to the minute, from
+    the head of its first file and the tail of its last. Until 2026-11-16 this parsed every
+    line of the first file a second time, which was a third of the time for a 90 MB session;
+    a chain's span now ends at the last file's last line instead of the first file's."""
+    first_ts = last_ts = branch = ""
+    if not chain:
+        return first_ts, last_ts, branch
+    try:
+        with open(chain[0], "rb") as fh:
+            for i, raw in enumerate(fh):
+                if i >= 5000 or (first_ts and branch):
+                    break
+                o = _json_line(raw)
+                if not isinstance(o, dict):
+                    continue
+                if not first_ts:
+                    first_ts = (o.get("timestamp") or "")[:16]
+                branch = branch or o.get("gitBranch") or ""
+    except OSError:
+        pass
+    try:
+        for raw in _lines_reversed(chain[-1]):
+            o = _json_line(raw)
+            if isinstance(o, dict) and o.get("timestamp"):
+                last_ts = o["timestamp"][:16]
+                break
+    except OSError:
+        pass
+    return first_ts, last_ts, branch
+
+
 def _cc_render_meta(chain, project_dir, kept):
     proj = project_dir.name.rsplit("-", 1)[-1] if project_dir else "?"
     sid = Path(chain[0]).stem if chain else "?"
-    # date range + git branch from the transcript
-    first_ts = last_ts = branch = ""
-    try:
-        for line in open(chain[0], encoding="utf-8", errors="replace"):
-            try:
-                o = json.loads(line)
-            except Exception:
-                continue
-            ts = (o.get("timestamp") or "")[:16]
-            if ts and not first_ts:
-                first_ts = ts
-            if ts:
-                last_ts = ts
-            branch = branch or o.get("gitBranch") or ""
-    except Exception:
-        pass
+    first_ts, last_ts, branch = _span_and_branch(chain)
     return {"project": proj, "sid": sid, "files": len(chain), "kept": kept,
             "first_ts": first_ts, "last_ts": last_ts, "branch": branch, "source": "Claude Code"}
 
@@ -1006,6 +1261,127 @@ def render(turns, meta, with_header=True, with_meta=True, slice_note=""):
         )
     out.append(body)
     return "\n".join(out).strip() + "\n"
+
+
+# ---- digest: the human's other sessions, since a moment ------------------------------
+# Added 2026-11-16 for the question a returning session should answer before it asks the
+# human what happened meanwhile. Each session is read from its end, only as far back as the
+# moment, so the cost follows the answer and not the size of the transcripts.
+_DIGEST_NOISE = ("[keepwarm ping]", "[Image:", "<command-", "<local-command", "Caveat:",
+                 "<task-notification", "<scheduled-task", "Base directory for this skill",
+                 "(Re-invocation of", "# ")          # "# ": the body of a skill or command
+_DIGEST_MIN_KB = 3                                   # a session opened and closed says nothing
+# A user line whose first content block is a tool result. On four real sessions (4,859 tool-result
+# lines, 853 typed ones) the marker was on 4,611 of the first kind and on none of the second.
+_TOOL_RESULT_LEAD = b'"content":[{"tool_use_id"'
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def user_messages_since(chain, lo=None, n=8):
+    """The human's last `n` messages at/after `lo` (a UTC timestamp string) in a chain,
+    oldest first, one line each, read from the end. Pasted skill bodies, scheduled pings
+    and image placeholders are not the human talking and are left out."""
+    got = []
+    for jsonl in reversed(chain):
+        prefilter = _compact_json(jsonl)
+        older = 0
+        for raw in (_marked_lines_reversed(jsonl, (_USER_MARK,)) if prefilter else _lines_reversed(jsonl)):
+            if prefilter and _TOOL_RESULT_LEAD in raw:
+                continue          # a tool result, never typed by the human, and the bulk of the user lines
+            o = _json_line(raw)
+            if not isinstance(o, dict):
+                continue
+            t = _turn_of(o, keep_thinking=False, level="user")
+            if not t or t[0] != USER_LABEL:
+                continue
+            if lo and t[2] and t[2] < lo:
+                older += 1
+                if older >= _OLDER_RUN:
+                    return got[::-1]
+                continue
+            older = 0
+            text = " ".join(t[1].split())
+            if text.startswith(_DIGEST_NOISE):
+                continue
+            got.append(text)
+            if len(got) >= n:
+                return got[::-1]
+    return got[::-1]
+
+
+def digest_sessions(rows, cutoff_ts, exclude):
+    """Sessions touched at/after `cutoff_ts` (epoch seconds), newest first, with `exclude`d
+    ids (the session asking) and tiny ones left out. Rows are (path, mtime, project_dir)."""
+    kept = []
+    for f, m, d in rows:
+        p = Path(f)
+        if m < cutoff_ts or p.stem in exclude or isinstance(d, str):
+            continue
+        try:
+            if p.stat().st_size < _DIGEST_MIN_KB * 1024:
+                continue
+        except OSError:
+            continue
+        kept.append((p, m, d))
+    kept.sort(key=lambda r: r[1], reverse=True)
+    return kept
+
+
+def render_digest(shown, messages_by_path, titles, per_session, chars, cap, total_found):
+    """The digest text, cut at the hard cap on whole sessions, never in the middle of one;
+    the first session is always shown."""
+    import datetime as _dt
+    lines, used, count = [], 0, 0
+    for p, m, d in shown:
+        msgs = messages_by_path.get(str(p))
+        title = titles.get(p.stem) or _first_user_title(str(p))
+        block = [f"{d.name.rsplit('-', 1)[-1]} · {_cut(title, 70)} · "
+                 f"last {_dt.datetime.fromtimestamp(m).strftime('%a %H:%M')}"]
+        if msgs is None:
+            block.append("  (could not be read)")
+        elif not msgs:
+            block.append("  (nothing from the human in it since then)")
+        else:
+            block += [f"  - {_cut(x, chars)}" for x in msgs[-per_session:]]
+        size = sum(len(x) + 1 for x in block)
+        if used + size > cap and count:
+            break
+        lines += block
+        used += size
+        count += 1
+    if count < total_found:
+        lines.append(f"(+{total_found - count} more sessions in the window, cut at the cap; "
+                     f"`{PROG} --list --all-projects` names them)")
+    return "\n".join(lines)
+
+
+def run_digest(a):
+    import datetime as _dt
+    import time as _time
+    if a.since:
+        try:
+            cutoff = _dt.datetime.fromisoformat(a.since.strip())
+        except ValueError:
+            raise SystemExit(f"{PROG}: cannot parse {a.since!r} — use YYYY-MM-DD or ISO 8601")
+    else:
+        cutoff = _dt.datetime.now() - _dt.timedelta(hours=a.hours or 24)
+    lo = _parse_bound(cutoff.strftime("%Y-%m-%dT%H:%M:%S"))
+    rows, _ = _scope_rows(a.project, all_projects=a.project is None, limit=100000)
+    found = digest_sessions(rows, _time.mktime(cutoff.timetuple()), set(a.exclude or []))
+    shown = found[: a.sessions]
+    messages = {}
+    for p, m, d in shown:          # one file each: the part of a compaction chain after the last compaction
+        try:
+            messages[str(p)] = user_messages_since([str(p)], lo, a.messages)
+        except OSError:
+            messages[str(p)] = None
+    print(f"Other sessions since {cutoff.strftime('%a %d %b %H:%M')}: {len(found)}")
+    if found:
+        titles = _ccd_titles_for({p.stem for p, _, _ in shown})
+        print(render_digest(shown, messages, titles, a.messages, a.chars, a.cap, len(found)))
 
 
 def main():
@@ -1032,7 +1408,26 @@ def main():
     ap.add_argument("--level", choices=("full", "user"), default="full",
                     help="'user' = human turns + assistant tool-call intents only "
                          "(drops assistant prose/thinking) — the cheap arc view for huge sessions")
+    ap.add_argument("--full-pass", action="store_true",
+                    help="with --since/--last: read the whole transcript instead of its end "
+                         "(slower; the banner then counts the session's turns)")
+    ap.add_argument("--digest", action="store_true",
+                    help="what the human did in their OTHER sessions since a moment: each "
+                         "session's title and the human's last messages in it, under a hard cap")
+    ap.add_argument("--hours", type=float, metavar="H", help="with --digest: the moment as H hours ago "
+                    "(default 24; --since gives it as a date or time)")
+    ap.add_argument("--exclude", action="append", metavar="ID",
+                    help="with --digest: a session id to leave out, usually the asking session (repeatable)")
+    ap.add_argument("--messages", type=int, default=8, metavar="N", help="with --digest: messages per session (default 8)")
+    ap.add_argument("--chars", type=int, default=220, metavar="N", help="with --digest: characters per message (default 220)")
+    ap.add_argument("--sessions", type=int, default=6, metavar="N", help="with --digest: sessions shown (default 6)")
+    ap.add_argument("--cap", type=int, default=6000, metavar="N",
+                    help="with --digest: hard limit in characters, about 1,500 tokens (default 6000)")
     a = ap.parse_args()
+
+    if a.digest:
+        run_digest(a)
+        return
 
     def rows_for_scope(limit, all_projects):
         if CODEX_DEFAULT:
@@ -1109,6 +1504,7 @@ def main():
             dirs = _dirs_containing_session(sid) or [d]
             chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
 
+    windowed = False        # True when distill_tail already applied the window (total unknown)
     if ag_id:
         chain = [str(_ag_log(ag_id))]
         turns = distill_antigravity(ag_id, keep_thinking=not a.no_thinking,
@@ -1127,25 +1523,41 @@ def main():
         if ver and not ver.startswith(KNOWN_VERSION_PREFIX):
             print(f"{PROG}: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
                   f"schema may have drifted, review output.", file=sys.stderr)
-        turns = distill(chain, keep_thinking=not a.no_thinking,
-                        thinking_chars=a.thinking_chars, level=a.level)
+        if (a.since or a.last) and not a.full_pass:
+            # A window is read from the end of the transcript: the cost follows the window.
+            turns = distill_tail(
+                chain, lo=_parse_bound(a.since) if a.since else None,
+                hi=_parse_bound(a.until, end_of_day=True) if a.until else None, last=a.last,
+                keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars, level=a.level)
+            windowed = True                 # the rest of the session was not read: its total is not counted
+        else:
+            turns = distill(chain, keep_thinking=not a.no_thinking,
+                            thinking_chars=a.thinking_chars, level=a.level)
     if not turns:
-        print(f"{PROG}: session had no distillable content.", file=sys.stderr)
+        print(f"{PROG}: the requested window contains no turns." if windowed
+              else f"{PROG}: session had no distillable content.", file=sys.stderr)
         sys.exit(1)
 
     total = len(turns)
     if a.since or a.until or a.last:
-        turns = window(turns, since=a.since, until=a.until, last=a.last)
-        if not turns:
-            print(f"{PROG}: the requested window contains no turns.", file=sys.stderr)
-            sys.exit(1)
+        if not windowed:
+            turns = window(turns, since=a.since, until=a.until, last=a.last)
+            if not turns:
+                print(f"{PROG}: the requested window contains no turns.", file=sys.stderr)
+                sys.exit(1)
 
     bits = []
     if a.since:  bits.append(f"since {a.since}")
     if a.until:  bits.append(f"until {a.until}")
     if a.last:   bits.append(f"last {a.last} turns")
     if a.level != "full": bits.append("level=user (assistant prose dropped, tool-call intents kept)")
-    slice_note = ", ".join(bits) + f" — {len(turns)} of {total} turns" if bits else ""
+    if not bits:
+        slice_note = ""
+    elif windowed:
+        slice_note = (", ".join(bits) + f" — {len(turns)} turns, read from the end of the session "
+                      f"(its total is not counted; --full-pass counts it)")
+    else:
+        slice_note = ", ".join(bits) + f" — {len(turns)} of {total} turns"
 
     meta = (_ag_render_meta(ag_id, len(turns)) if ag_id
             else _codex_render_meta(codex_path, len(turns)) if codex_path
