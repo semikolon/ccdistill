@@ -129,6 +129,28 @@ It handles the **compaction chain** (a session split across multiple files shari
 `sessionId`) and resolves sessions by `sessionId` + newest mtime, dodging Claude Code's
 stale-transcript-path-on-continued-sessions behavior.
 
+### Forked sessions
+
+A forked session's file opens with its parent's history copied line for line, under the
+parent's id, and goes on under its own. ccdistill reads each fork as its own session and
+leaves the copied history out, since the parent's transcript holds it: reading a fork costs
+only what is new in it. The header says where it was forked from and when (`Forked from:`),
+and a parent's header lists its forks (`Forked into:`). `--list` marks a fork with
+`(fork of <id>)`, and `--list --json` gives `forked_from`.
+
+| Command | Reads |
+|---|---|
+| `ccdistill <fork>` | the fork's own turns |
+| `ccdistill <fork> --inherited` | the copied history too, with a ⑂ marker where the fork's own turns begin |
+| `ccdistill <parent>` | the parent's own turns, including those after the fork |
+| `ccdistill --family <any member>` | the oldest ancestor on disk, then each fork's own turns under a `⑂ Branch:` heading, every turn once; a ⑂ marker in each session shows where a fork branches off |
+
+When a fork's parent transcript is gone, its copied history is shown, since nothing else holds it.
+
+Measured on one desktop session forked twice (2026-11-22, 75 MB of transcript): read one by
+one before this, each of the three repeated the shared history and the parent was mixed with
+both forks; now the parent is ~87k tokens, the forks ~39k and ~62k, and `--family` ~188k.
+
 ## Options
 
 ```
@@ -149,6 +171,8 @@ stale-transcript-path-on-continued-sessions behavior.
 --level user       human turns + assistant tool-call intents only (drops assistant prose)
 --full-pass        with --since/--last: read the whole transcript instead of its end (slower;
                    the banner then counts the session's turns)
+--inherited        for a forked session: also show the history it copied from its parent
+--family           the session, its ancestors on disk and every fork of any of them, each turn once
 --digest           the human's other sessions since a moment, capped (see above)
 --hours H          with --digest: the moment as H hours ago (default 24; --since gives a date/time)
 --exclude ID       with --digest: leave a session out, usually the asking one (repeatable)

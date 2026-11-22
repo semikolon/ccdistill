@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ccdistill — distill a Claude Code or Codex session transcript into a lean resume brief.
+ccdistill — distill a Claude Code, Codex or Antigravity (Gemini) conversation into a lean resume brief.
 
 Purpose:
   Resuming a large, cold (>cache-TTL) CC session with `claude --resume` reprocesses
@@ -46,6 +46,9 @@ Flags:
   --since/--until/--last/--level   slice a long session (see the README); --since and --last
                      are read from the END of the transcript, so the cost follows the slice
   --full-pass        with --since/--last: read the whole transcript instead (slower; counts turns)
+  --inherited        for a forked session: also show the history it copied from its parent
+  --family           the session, its ancestors on disk and every fork of any of them, each turn
+                     once: the shared history first, then each fork's own turns
   --digest           the human's OTHER sessions since a moment: each session's title and the
                      human's last messages in it, under a hard cap (about 1,500 tokens):
                        ccdistill --digest --hours 20 --exclude <this session's id>
@@ -76,6 +79,9 @@ Antigravity (Gemini) conversations:
 
 Notes:
   - Handles the compaction chain (multiple files sharing one sessionId).
+  - A forked session (its file opens with the parent's records under the parent's id) is its
+    own session: its copied history is left out when the parent's transcript is on disk,
+    `--inherited` shows it, `--family` reads parent and forks with every turn once.
   - A project can live in SEVERAL dirs at once (live root + archive roots): all
     matching dirs are unioned, deduped by session id (newest copy wins) — an
     archive root must never shadow live sessions.
@@ -208,10 +214,213 @@ def _may_hold_session(jsonl: str, sid: str) -> bool:
     return _SESSION_ID_RE.search(head) is None
 
 
+def _sid_marker(sid: str) -> bytes:
+    return b'"sessionId":"' + sid.encode("utf-8") + b'"'
+
+
+def _file_finds(jsonl: str, needle: bytes) -> int:
+    """Offset of the first `needle` in a file, or -1: a memory-mapped search, which runs in C,
+    so finding where a fork's own records begin in a 70 MB transcript costs milliseconds."""
+    try:
+        with open(jsonl, "rb") as fh:
+            try:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except (ValueError, OSError):
+                return -1
+            with mm:
+                return mm.find(needle)
+    except OSError:
+        return -1
+
+
+# ---- forks ----------------------------------------------------------------------------------
+# A forked session's file opens with its parent's records copied line for line (same uuids,
+# the PARENT's sessionId) and goes on under its own id; the parent's file goes on under the
+# parent's. Checked on three desktop forks of one session, 2026-11-22. Until then a file's
+# session was the first id in it, so a parent and its forks were read as one chain, every
+# fork repeating the shared history. Now a file is the session its name says whenever records
+# under that name are in it, a fork shows only its own turns, and --family reads a parent and
+# all its forks with the shared history once.
+_fork_cache: dict = {}
+
+
+def _fork_scan(jsonl: str, own: str):
+    """Where the records of `own` begin in a file that opens with another session's records:
+    {own, parent, fork_ts, first_own_ts}, or None when no record is under `own`. `parent` is
+    the session of the last copied record (a fork of a fork names its nearest parent),
+    `fork_ts` that record's time and `first_own_ts` the time of the first own record that has
+    one, UTC to the second."""
+    marker = _sid_marker(own)
+    try:
+        fh = open(jsonl, "rb")
+    except OSError:
+        return None
+    with fh:
+        try:
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            return None
+        with mm:
+            size, pos = len(mm), 0
+            while True:                           # the first LINE whose own sessionId is `own`
+                hit = mm.find(marker, pos)
+                if hit < 0:
+                    return None
+                start = mm.rfind(b"\n", 0, hit) + 1
+                stop = mm.find(b"\n", hit)
+                stop = size if stop < 0 else stop
+                o = _json_line(bytes(mm[start:stop]))
+                if isinstance(o, dict) and o.get("sessionId") == own:
+                    break
+                pos = stop
+            parent = fork_ts = None
+            end, looked = start - 1, 0            # end: the line break before the own records
+            while end > 0 and (parent is None or fork_ts is None) and looked < 5000:
+                s = mm.rfind(b"\n", 0, end) + 1
+                o = _json_line(bytes(mm[s:end]))
+                looked += 1
+                if isinstance(o, dict):
+                    sid = o.get("sessionId")
+                    if parent is None and sid and sid != own:
+                        parent = sid
+                    if fork_ts is None and o.get("timestamp"):
+                        fork_ts = o["timestamp"][:19]
+                end = s - 1
+            if not parent:
+                return None
+            first_own_ts, p, looked = "", start, 0
+            while p < size and looked < 5000:
+                e = mm.find(b"\n", p)
+                e = size if e < 0 else e
+                o = _json_line(bytes(mm[p:e]))
+                looked += 1
+                if isinstance(o, dict) and o.get("sessionId") == own and o.get("timestamp"):
+                    first_own_ts = o["timestamp"][:19]
+                    break
+                p = e + 1
+            return {"own": own, "parent": parent, "fork_ts": fork_ts or "", "first_own_ts": first_own_ts}
+
+
+def _fork_info(jsonl: str):
+    """{own, parent, fork_ts, first_own_ts} when this transcript file is a forked session,
+    else None. Cached per path."""
+    key = str(jsonl)
+    if key not in _fork_cache:
+        stem = Path(key).stem
+        first = _session_id_of(key)
+        _fork_cache[key] = _fork_scan(key, stem) if first and first != stem else None
+    return _fork_cache[key]
+
+
+def _own_id(jsonl: str) -> str:
+    """The session a transcript file belongs to: its name, which Claude Code gives it, unless
+    no record in it is under that name. Such a file (an old compaction continuation) belongs to
+    the session its records name. A fork's file is its own session, not its parent's."""
+    stem = Path(str(jsonl)).stem
+    first = _session_id_of(str(jsonl))
+    if not first or first == stem or _fork_info(str(jsonl)):
+        return stem
+    return first
+
+
+def _session_file(sid: str, near: Path | None = None):
+    """The transcript file named by a session id: next to `near` first, then in every root."""
+    if near is not None and (near / f"{sid}.jsonl").is_file():
+        return near / f"{sid}.jsonl"
+    for d in _dirs_containing_session(sid):
+        if (d / f"{sid}.jsonl").is_file():
+            return d / f"{sid}.jsonl"
+    return None
+
+
+def _session_title(jsonl, sid: str | None = None) -> str:
+    """A session's name: the desktop app's title, else the last title the session set itself
+    (a custom-title record under its own id), else its first own typed message."""
+    jsonl = str(jsonl)
+    sid = sid or Path(jsonl).stem
+    t = _ccd_titles_for({sid}).get(sid)
+    if t:
+        return t
+    for raw in _marked_lines_reversed(jsonl, (b'"type":"custom-title"',)):
+        o = _json_line(raw)
+        if isinstance(o, dict) and o.get("sessionId") == sid and o.get("customTitle"):
+            return " ".join(str(o["customTitle"]).split())
+    fi = _fork_info(jsonl)
+    if fi:
+        for o in _lines_forward(jsonl):
+            if o.get("sessionId") != sid:
+                continue
+            t = _turn_of(o, keep_thinking=False, level="user")
+            if t and t[0] == USER_LABEL:
+                return " ".join(t[1].split())[:70]
+        return "(no title)"
+    return _first_user_title(jsonl)
+
+
+def _children_of(sid: str, jsonl, dirs):
+    """Sessions forked directly from `sid`, as [(path, fork_info)] in fork order. A fork's file
+    opens with the records its whole lineage shares, so only files whose first 64 KB name the
+    same first session are opened, and of those only files that name `sid`."""
+    lineage = _session_id_of(str(jsonl)) or sid
+    lineage_mark, marker = _sid_marker(lineage), _sid_marker(sid)
+    seen = {}
+    for d in dirs:
+        for f in Path(d).glob("*.jsonl"):
+            if "subagent" in f.name or f.name.startswith("agent-") or f.stem == sid:
+                continue
+            try:
+                with open(f, "rb") as fh:
+                    head = fh.read(_HEAD_BYTES)
+            except OSError:
+                continue
+            if lineage_mark not in head:
+                continue
+            if lineage != sid and _file_finds(str(f), marker) < 0:
+                continue
+            fi = _fork_info(str(f))
+            if fi and fi["parent"] == sid:
+                mt = f.stat().st_mtime
+                if f.stem not in seen or mt > seen[f.stem][2]:
+                    seen[f.stem] = (f, fi, mt)
+    return [(f, fi) for f, fi, _ in sorted(seen.values(), key=lambda x: (x[1]["fork_ts"], x[0].stem))]
+
+
+def _fork_filter(chain, include_inherited=False):
+    """({file: own id} for the forked files of a chain whose copied records are left out,
+    {file: marker text} for those whose copied records are shown). Copied records are left out
+    when the parent's own transcript is on disk, where they can be read once; otherwise, or
+    with include_inherited, they are shown, with a marker where the fork's own turns begin."""
+    only, marks = {}, {}
+    for f in chain:
+        fi = _fork_info(f)
+        if not fi:
+            continue
+        pf = _session_file(fi["parent"], Path(f).parent)
+        if pf is not None and not include_inherited:
+            only[f] = fi["own"]
+        elif pf is not None:
+            marks[f] = (f"⑂ This session was forked here from `{fi['parent']}` «{_session_title(pf, fi['parent'])}» "
+                        f"at {_local(fi['fork_ts'])}; the turns above are that session's history up to here.")
+        else:
+            marks[f] = (f"⑂ This session was forked here from `{fi['parent']}`, whose own transcript was not "
+                        f"found, so the history it copied from that session is shown above.")
+    return only, marks
+
+
+def _local(ts19: str) -> str:
+    """A UTC timestamp to the second, in local time with its zone, to the minute."""
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(ts19[:19] + "+00:00").astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except ValueError:
+        return ts19
+
+
 def _chain_for_session(sid: str, project_dirs):
     """All transcript files for a sessionId (compaction chain) across the given
     project dirs, oldest-first. Deduped by file stem — if the same transcript
-    exists in both a live and an archive dir, the newest copy wins."""
+    exists in both a live and an archive dir, the newest copy wins. A fork of the
+    session is another session and is not in its chain (see _own_id)."""
     if isinstance(project_dirs, Path):
         project_dirs = [project_dirs]
     seen = {}  # stem -> (path, mtime)
@@ -221,7 +430,7 @@ def _chain_for_session(sid: str, project_dirs):
                 continue
             if f.stem != sid and not _may_hold_session(str(f), sid):
                 continue
-            if _session_id_of(str(f)) == sid:
+            if f.stem == sid or _own_id(str(f)) == sid:
                 mt = f.stat().st_mtime
                 if f.stem not in seen or mt > seen[f.stem][1]:
                     seen[f.stem] = (str(f), mt)
@@ -300,7 +509,7 @@ def _find_session(arg: str):
     (Claude Desktop) session-title substring. Return (chain, project_dir)."""
     p = Path(arg)
     if p.suffix == ".jsonl" and p.exists():
-        sid = _session_id_of(str(p)) or p.stem
+        sid = _own_id(str(p))
         return _chain_for_session(sid, p.parent), p.parent
     # 1) exact match on filename stem (Claude Code names a file by its session UUID: a direct
     #    look, no file opened), then on the in-file sessionId
@@ -308,7 +517,7 @@ def _find_session(arg: str):
         for d in Path(root).iterdir():
             if d.is_dir() and (d / f"{arg}.jsonl").is_file():
                 f = d / f"{arg}.jsonl"
-                sid = _session_id_of(str(f)) or f.stem
+                sid = _own_id(str(f))
                 dirs = _dirs_containing_session(sid) or [d]
                 return _chain_for_session(sid, dirs), dirs[0]
     for root in _roots():
@@ -316,8 +525,8 @@ def _find_session(arg: str):
             if not d.is_dir():
                 continue
             for f in d.glob("*.jsonl"):
-                if f.stem == arg or (_may_hold_session(str(f), arg) and _session_id_of(str(f)) == arg):
-                    sid = _session_id_of(str(f)) or f.stem
+                if f.stem == arg or (_may_hold_session(str(f), arg) and _own_id(str(f)) == arg):
+                    sid = _own_id(str(f))
                     dirs = _dirs_containing_session(sid) or [d]
                     return _chain_for_session(sid, dirs), dirs[0]
     # 2) unique-prefix match (git-style short ids; CC names files by session UUID)
@@ -332,7 +541,7 @@ def _find_session(arg: str):
             for f in d.glob(f"{arg}*.jsonl"):
                 if "subagent" in f.name or f.name.startswith("agent-"):
                     continue
-                sid = _session_id_of(str(f)) or f.stem
+                sid = _own_id(str(f))
                 mt = f.stat().st_mtime
                 if sid not in matches or mt > matches[sid][1]:
                     matches[sid] = (d, mt)
@@ -433,25 +642,31 @@ def _emit_list(rows, as_json):
     titles = _ccd_titles_for({Path(f).stem for f, _, d in rows if not isinstance(d, str)})
     items = []
     for f, m, d in rows:
+        fork = None
         if isinstance(d, str):        # a Codex row carries its project name, not a dir
             sid = _codex_id(f)
             project, title = d, _codex_title(f)
         else:
             sid = Path(f).stem
-            project, title = d.name.rsplit("-", 1)[-1], titles.get(sid) or _first_user_title(str(f))
+            fi = _fork_info(str(f))
+            fork = fi["parent"] if fi else None
+            project = d.name.rsplit("-", 1)[-1]
+            title = titles.get(sid) or (_session_title(f, sid) if fi else _first_user_title(str(f)))
         items.append({
             "id": sid,
             "modified": _dt.datetime.fromtimestamp(m).isoformat(timespec="minutes"),
             "project": project,
             "size_kb": Path(f).stat().st_size // 1024,
             "title": title,
+            "forked_from": fork,
         })
     if as_json:
         print(json.dumps(items, indent=2))
     else:
         for it in items:
+            fork = f'  (fork of {it["forked_from"][:8]})' if it["forked_from"] else ""
             print(f'{it["id"]}\t{it["modified"]}\t{it["size_kb"]:>6} KB\t'
-                  f'{it["project"]:<16}\t{it["title"]}')
+                  f'{it["project"]:<16}\t{it["title"]}{fork}')
 
 
 # ---- tool_use → one-line intent stub -----------------------------------------
@@ -650,11 +865,27 @@ def _lines_backward(jsonl: str):
             yield o
 
 
-def distill(chain, keep_thinking=True, thinking_chars=700, level="full"):
-    """Every kept turn of a transcript chain, oldest first (see _turn_of for `level`)."""
+def _copied(o, jsonl, only) -> bool:
+    """Is this record one a fork copied from its parent and is it to be left out (see _fork_filter)?"""
+    own = only.get(jsonl) if only else None
+    sid = o.get("sessionId")
+    return bool(own and sid and sid != own)
+
+
+def distill(chain, keep_thinking=True, thinking_chars=700, level="full", only=None, marks=None):
+    """Every kept turn of a transcript chain, oldest first (see _turn_of for `level`). `only`
+    and `marks` come from _fork_filter: a fork's copied records left out, or a marker turn
+    where its own records begin."""
     turns = []
     for jsonl in chain:
+        mark = (marks or {}).get(jsonl)
+        own = (_fork_info(jsonl) or {}).get("own") if mark else None
         for o in _lines_forward(jsonl):
+            if _copied(o, jsonl, only):
+                continue
+            if mark and o.get("sessionId") == own:
+                turns.append(("⑂ Fork", mark, ""))
+                mark = None
             t = _turn_of(o, keep_thinking, thinking_chars, level)
             if t:
                 turns.append(t)
@@ -678,7 +909,8 @@ def _last_timestamp(jsonl: str) -> str:
     return ""
 
 
-def distill_tail(chain, lo=None, hi=None, last=None, keep_thinking=True, thinking_chars=700, level="full"):
+def distill_tail(chain, lo=None, hi=None, last=None, keep_thinking=True, thinking_chars=700, level="full",
+                 only=None):
     """The turns inside a window, read from the END of the chain instead of through all of
     it: what `distill` followed by `window` returns, at the cost of the window. `lo`/`hi` are
     UTC timestamp strings (see _parse_bound), `last` a turn count. A turn with no timestamp
@@ -695,6 +927,8 @@ def distill_tail(chain, lo=None, hi=None, last=None, keep_thinking=True, thinkin
                 continue
         older = 0
         for o in _lines_backward(jsonl):
+            if _copied(o, jsonl, only):
+                break                     # the copied records open the file: all older than this
             t = _turn_of(o, keep_thinking, thinking_chars, level)
             if not t:
                 continue
@@ -1237,12 +1471,102 @@ def _span_and_branch(chain):
     return first_ts, last_ts, branch
 
 
-def _cc_render_meta(chain, project_dir, kept):
+def _cc_render_meta(chain, project_dir, kept, notes=(), first_ts=None):
     proj = project_dir.name.rsplit("-", 1)[-1] if project_dir else "?"
-    sid = Path(chain[0]).stem if chain else "?"
-    first_ts, last_ts, branch = _span_and_branch(chain)
+    sid = _own_id(chain[-1]) if chain else "?"
+    span_first, last_ts, branch = _span_and_branch(chain)
     return {"project": proj, "sid": sid, "files": len(chain), "kept": kept,
-            "first_ts": first_ts, "last_ts": last_ts, "branch": branch, "source": "Claude Code"}
+            "first_ts": (first_ts or "")[:16] or span_first, "last_ts": last_ts, "branch": branch,
+            "source": "Claude Code", "notes": list(notes)}
+
+
+def _relation_notes(chain, only):
+    """Header lines naming the session a chain was forked from and the sessions forked from it,
+    and where a fork's own span starts when its copied history is left out."""
+    notes, start = [], None
+    if not chain:
+        return notes, start
+    sid = _own_id(chain[-1])
+    for f in chain:
+        fi = _fork_info(f)
+        if not fi:
+            continue
+        pf = _session_file(fi["parent"], Path(f).parent)
+        when = _local(fi["fork_ts"])
+        if f in only:
+            start = fi["first_own_ts"]
+            notes.append(f"**Forked from:** `{fi['parent']}` «{_session_title(pf, fi['parent'])}» at {when}. "
+                         f"The history it copied from there is not repeated here: `{PROG} {fi['parent']}` has it, "
+                         f"`--inherited` shows it here, `--family` reads the parent and all its forks once each.")
+        elif pf is not None:
+            notes.append(f"**Forked from:** `{fi['parent']}` «{_session_title(pf, fi['parent'])}» at {when}; "
+                         f"the history it copied from there is shown, up to the ⑂ marker.")
+        else:
+            notes.append(f"**Forked from:** `{fi['parent']}` at {when}; that session's own transcript was not "
+                         f"found, so the history copied from it is shown, up to the ⑂ marker.")
+        break
+    kids = _children_of(sid, chain[-1], sorted({Path(f).parent for f in chain}))
+    if kids:
+        parts = [f"`{kfi['own']}` «{_session_title(kp, kfi['own'])}» at {_local(kfi['fork_ts'])}" for kp, kfi in kids]
+        notes.append("**Forked into:** " + "; ".join(parts) + f". Their own turns are not here: "
+                     f"`{PROG} <id>` reads one, `{PROG} --family {sid}` reads this session and its forks once each.")
+    return notes, start
+
+
+def family_turns(chain, keep_thinking=True, thinking_chars=700, level="full", since=None, until=None, last=None):
+    """A session, the session it was forked from, and every session forked from any of them,
+    each turn once: (turns, files read, trunk chain, member ids). The trunk is the oldest
+    ancestor whose transcript is on disk; its turns come first, with a ⑂ marker where each fork
+    branches off, then each fork's own turns under its own heading, a fork's forks after it.
+    since/until/last apply to each session's turns."""
+    trunk = chain
+    for _ in range(64):                                 # climb while the parent's transcript is on disk
+        fi = next((x for x in map(_fork_info, trunk) if x), None)
+        if not fi:
+            break
+        pf = _session_file(fi["parent"], Path(trunk[0]).parent)
+        if pf is None:
+            break
+        pchain = _chain_for_session(fi["parent"], _dirs_containing_session(fi["parent"]) or [pf.parent])
+        if not pchain:
+            break
+        trunk = pchain
+    out, files, members = [], [], []
+
+    def section(ch, heading):
+        sid = _own_id(ch[-1])
+        if sid in members:
+            return
+        members.append(sid)
+        files.extend(ch)
+        only, marks = _fork_filter(ch)
+        turns = window(distill(ch, keep_thinking, thinking_chars, level, only=only, marks=marks),
+                       since=since, until=until, last=last)
+        kids = _children_of(sid, ch[-1], sorted({Path(f).parent for f in ch}))
+        at = {}
+        for kp, kfi in kids:                            # each fork's marker after the last turn before it
+            i = 0
+            for j, t in enumerate(turns):
+                if t[2] and t[2] <= kfi["fork_ts"]:
+                    i = j + 1
+            at.setdefault(i, []).append((kp, kfi))
+        if heading:
+            out.append(heading)
+        for j in range(len(turns) + 1):
+            for kp, kfi in at.get(j, []):
+                out.append(("⑂ Fork", f"«{_session_title(kp, kfi['own'])}» (`{kfi['own']}`) branches off here; "
+                                      f"its own turns are in its section below.", ""))
+            if j < len(turns):
+                out.append(turns[j])
+        title = _session_title(ch[-1], sid)
+        for kp, kfi in kids:
+            kch = _chain_for_session(kfi["own"], [kp.parent]) or [str(kp)]
+            section(kch, (f"⑂ Branch: {_session_title(kp, kfi['own'])}",
+                          f"`{kfi['own']}`, forked from «{title}» (`{sid}`) at {_local(kfi['fork_ts'])}. "
+                          f"Its own turns:", ""))
+
+    section(trunk, None)
+    return out, files, trunk, members
 
 
 def render(turns, meta, with_header=True, with_meta=True, slice_note=""):
@@ -1256,6 +1580,7 @@ def render(turns, meta, with_header=True, with_meta=True, slice_note=""):
             f"**Session:** {meta['sid']}  •  **Files in chain:** "
             f"{meta['files']}  •  **Turns kept:** {meta['kept']}\n"
             f"**Span:** {meta['first_ts']} → {meta['last_ts']}  •  **Branch:** {meta['branch'] or '?'}\n"
+            + "".join(f"{n}\n" for n in meta.get("notes") or ())
             + (f"\n> ⚠ **PARTIAL VIEW — {slice_note}.** This is a slice of the session, "
                f"not the whole thing; anything outside it is unread.\n" if slice_note else "")
         )
@@ -1285,6 +1610,7 @@ def user_messages_since(chain, lo=None, n=8):
     oldest first, one line each, read from the end. Pasted skill bodies, scheduled pings
     and image placeholders are not the human talking and are left out."""
     got = []
+    only, _ = _fork_filter(chain)     # a fork's copied messages are its parent's, read there
     for jsonl in reversed(chain):
         prefilter = _compact_json(jsonl)
         older = 0
@@ -1294,6 +1620,8 @@ def user_messages_since(chain, lo=None, n=8):
             o = _json_line(raw)
             if not isinstance(o, dict):
                 continue
+            if _copied(o, jsonl, only):
+                break             # the copied records open the file: everything older is the parent's
             t = _turn_of(o, keep_thinking=False, level="user")
             if not t or t[0] != USER_LABEL:
                 continue
@@ -1411,6 +1739,12 @@ def main():
     ap.add_argument("--full-pass", action="store_true",
                     help="with --since/--last: read the whole transcript instead of its end "
                          "(slower; the banner then counts the session's turns)")
+    ap.add_argument("--inherited", action="store_true",
+                    help="for a forked session: also show the history it copied from its parent "
+                         "(left out by default, since the parent's own transcript has it)")
+    ap.add_argument("--family", action="store_true",
+                    help="the session, the session it was forked from and every fork of either, "
+                         "each turn once: the shared history first, then each fork's own turns")
     ap.add_argument("--digest", action="store_true",
                     help="what the human did in their OTHER sessions since a moment: each "
                          "session's title and the human's last messages in it, under a hard cap")
@@ -1500,11 +1834,33 @@ def main():
         if isinstance(d, str):
             codex_path = f
         else:
-            sid = _session_id_of(str(f)) or f.stem
+            sid = _own_id(str(f))
             dirs = _dirs_containing_session(sid) or [d]
             chain, project_dir = _chain_for_session(sid, dirs), dirs[0]
 
     windowed = False        # True when distill_tail already applied the window (total unknown)
+    notes, own_start = [], None
+    if a.family and not chain:
+        print(f"{PROG}: --family reads Claude Code sessions; Codex and Antigravity sessions do not fork.",
+              file=sys.stderr)
+        sys.exit(2)
+    if a.family:
+        turns, files, trunk, members = family_turns(
+            chain, keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars, level=a.level,
+            since=a.since, until=a.until, last=a.last)
+        if not turns:
+            print(f"{PROG}: the family had no distillable content in this window.", file=sys.stderr)
+            sys.exit(1)
+        meta = _cc_render_meta(trunk, project_dir, len(turns), notes=[
+            f"**Family:** {len(members)} sessions, each turn once: the shared history first, then each "
+            f"fork's own turns under a ⑂ Branch heading. Members: " + ", ".join(f"`{m}`" for m in members)])
+        bits = [b for b in (f"since {a.since}" if a.since else "", f"until {a.until}" if a.until else "",
+                            f"last {a.last} turns of each session" if a.last else "",
+                            "level=user (assistant prose dropped, tool-call intents kept)" if a.level != "full" else "")
+                if b]
+        _emit(render(turns, meta, with_header=not (a.no_header or a.raw), with_meta=not a.raw,
+                     slice_note=", ".join(bits)), files, turns, a)
+        return
     if ag_id:
         chain = [str(_ag_log(ag_id))]
         turns = distill_antigravity(ag_id, keep_thinking=not a.no_thinking,
@@ -1523,16 +1879,19 @@ def main():
         if ver and not ver.startswith(KNOWN_VERSION_PREFIX):
             print(f"{PROG}: warning — session CC version {ver} outside tested {KNOWN_VERSION_PREFIX}x; "
                   f"schema may have drifted, review output.", file=sys.stderr)
+        only, marks = _fork_filter(chain, include_inherited=a.inherited)
+        notes, own_start = _relation_notes(chain, only)
         if (a.since or a.last) and not a.full_pass:
             # A window is read from the end of the transcript: the cost follows the window.
             turns = distill_tail(
                 chain, lo=_parse_bound(a.since) if a.since else None,
                 hi=_parse_bound(a.until, end_of_day=True) if a.until else None, last=a.last,
-                keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars, level=a.level)
+                keep_thinking=not a.no_thinking, thinking_chars=a.thinking_chars, level=a.level,
+                only=only)
             windowed = True                 # the rest of the session was not read: its total is not counted
         else:
             turns = distill(chain, keep_thinking=not a.no_thinking,
-                            thinking_chars=a.thinking_chars, level=a.level)
+                            thinking_chars=a.thinking_chars, level=a.level, only=only, marks=marks)
     if not turns:
         print(f"{PROG}: the requested window contains no turns." if windowed
               else f"{PROG}: session had no distillable content.", file=sys.stderr)
@@ -1561,12 +1920,16 @@ def main():
 
     meta = (_ag_render_meta(ag_id, len(turns)) if ag_id
             else _codex_render_meta(codex_path, len(turns)) if codex_path
-            else _cc_render_meta(chain, project_dir, len(turns)))
+            else _cc_render_meta(chain, project_dir, len(turns), notes=notes, first_ts=own_start))
     text = render(turns, meta,
                   with_header=not (a.no_header or a.raw),
                   with_meta=not a.raw,
                   slice_note=slice_note)
+    _emit(text, chain, turns, a)
 
+
+def _emit(text, chain, turns, a):
+    """Write the brief, with the size line and the secret warning on stderr."""
     if _SECRET_RE.search(text):
         print(f"{PROG}: ⚠ possible secret in output (a tool input may contain a key) — review before sharing.",
               file=sys.stderr)
